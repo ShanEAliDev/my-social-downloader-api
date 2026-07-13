@@ -1,4 +1,5 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
 yt-dlp
+slowapi
+python-multipart
