@@ -200,6 +200,17 @@ def home():
     return {"message": "API Working"}
 
 
+@app.get("/debug/yt-dlp-version", dependencies=[Depends(require_api_key)])
+def debug_ytdlp_version():
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--version"], capture_output=True, text=True, timeout=15
+        )
+        return {"version": result.stdout.strip() or result.stderr.strip()}
+    except Exception as e:
+        return {"version": None, "error": str(e)}
+
+
 @app.get("/debug/list-files", dependencies=[Depends(require_api_key)])
 def debug_list_files():
     try:
@@ -292,6 +303,15 @@ def download_task(url: str, task_id: str, file_path: str):
         "-o", file_path,
         "--max-filesize", "500M",
     ]
+
+    # YouTube specifically: try several internal "player clients". YouTube
+    # has been rolling out a PO Token requirement for some clients' stream
+    # URLs - when yt-dlp can't produce one, that client's formats get
+    # silently dropped, which is what causes "Requested format is not
+    # available" even though the video itself is fine. Trying multiple
+    # clients means we only need ONE of them to still work unauthenticated.
+    if "youtube.com" in url or "youtu.be" in url:
+        cmd += ["--extractor-args", "youtube:player_client=web,android,tv,ios"]
 
     cookie_path = cookie_file_for_url(url)
     if cookie_path:
