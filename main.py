@@ -202,13 +202,22 @@ def home():
 
 @app.get("/debug/yt-dlp-version", dependencies=[Depends(require_api_key)])
 def debug_ytdlp_version():
+    result = {}
     try:
-        result = subprocess.run(
-            ["yt-dlp", "--version"], capture_output=True, text=True, timeout=15
-        )
-        return {"version": result.stdout.strip() or result.stderr.strip()}
+        r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=15)
+        result["yt_dlp_version"] = r.stdout.strip() or r.stderr.strip()
     except Exception as e:
-        return {"version": None, "error": str(e)}
+        result["yt_dlp_version"] = None
+        result["yt_dlp_error"] = str(e)
+
+    try:
+        r = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=15)
+        result["node_version"] = r.stdout.strip() or r.stderr.strip()
+    except Exception as e:
+        result["node_version"] = None
+        result["node_error"] = str(e)
+
+    return result
 
 
 @app.get("/debug/list-files", dependencies=[Depends(require_api_key)])
@@ -302,6 +311,15 @@ def download_task(url: str, task_id: str, file_path: str):
         "-S", "ext:mp4:m4a",
         "-o", file_path,
         "--max-filesize", "500M",
+        # The Docker image installs Node.js specifically so this has a
+        # runtime to use for YouTube's JS signature/n-parameter challenge.
+        # Without a working JS runtime, YouTube formats get silently
+        # dropped and every download fails with "format not available".
+        "--js-runtimes", "node",
+        # Belt-and-suspenders: also allow fetching the EJS solver scripts
+        # straight from GitHub if the bundled ones (from yt-dlp[default])
+        # are ever missing or out of date.
+        "--remote-components", "ejs:github",
     ]
 
     # YouTube specifically: try several internal "player clients". YouTube
@@ -311,7 +329,7 @@ def download_task(url: str, task_id: str, file_path: str):
     # available" even though the video itself is fine. Trying multiple
     # clients means we only need ONE of them to still work unauthenticated.
     if "youtube.com" in url or "youtu.be" in url:
-        cmd += ["--extractor-args", "youtube:player_client=web,android,tv,ios"]
+        cmd += ["--extractor-args", "youtube:player_client=web,tv"]
 
     cookie_path = cookie_file_for_url(url)
     if cookie_path:
