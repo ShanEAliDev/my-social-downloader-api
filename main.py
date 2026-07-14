@@ -259,6 +259,8 @@ def download_task(url: str, task_id: str, file_path: str):
     logger.info(f"[{task_id}] Running yt-dlp (cookies={'yes' if cookie_path else 'no'})")
 
     last_progress = 0
+    output_tail = []  # keep the last ~20 lines so failures are self-explanatory
+    TAIL_MAX = 20
 
     try:
         process = subprocess.Popen(
@@ -275,6 +277,10 @@ def download_task(url: str, task_id: str, file_path: str):
                 continue
             logger.info(f"[{task_id}] yt-dlp: {line}")
 
+            output_tail.append(line)
+            if len(output_tail) > TAIL_MAX:
+                output_tail.pop(0)
+
             pct = parse_progress_line(line)
             if pct is not None and pct != last_progress:
                 last_progress = pct
@@ -289,12 +295,19 @@ def download_task(url: str, task_id: str, file_path: str):
         logger.info(f"[{task_id}] yt-dlp exited with code {returncode}")
 
         if returncode != 0:
+            # Prefer the last real ERROR line yt-dlp printed, since that's
+            # almost always the actionable one (bot-check, private video,
+            # geo-block, etc). Fall back to the raw tail if none matched.
+            error_lines = [l for l in output_tail if "ERROR" in l]
+            detail = "\n".join(error_lines[-3:]) if error_lines else "\n".join(output_tail[-6:])
+            detail = detail[:1500]  # keep the status payload sane
+
             save_task(task_id, {
                 "status": "failed",
                 "progress": last_progress,
                 "url": url,
                 "file_path": file_path,
-                "error": f"yt-dlp exited with code {returncode}, see logs for details",
+                "error": detail or f"yt-dlp exited with code {returncode}, no output captured",
             })
             return
 
