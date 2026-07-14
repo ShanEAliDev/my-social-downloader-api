@@ -351,6 +351,27 @@ def get_status(task_id: str):
     return task
 
 
+@app.get("/file-status/{task_id}", dependencies=[Depends(require_api_key)])
+def file_status(task_id: str):
+    """
+    Cheap existence check - lets a client know whether a completed
+    download is still retrievable before showing a "Download" button,
+    without pulling the whole file just to find out.
+    """
+    tasks = load_tasks()
+    task = tasks.get(task_id)
+    if not task or task.get("status") != "completed":
+        return {"available": False}
+
+    file_path = task.get("file_path")
+    if file_path and os.path.exists(file_path):
+        return {"available": True}
+
+    matches = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
+    matches = [m for m in matches if not m.endswith(".json")]
+    return {"available": bool(matches)}
+
+
 @app.get("/download-file/{task_id}", dependencies=[Depends(require_api_key)])
 @limiter.limit("20/minute")
 def serve_file(request: Request, task_id: str):
