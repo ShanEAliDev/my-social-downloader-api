@@ -188,7 +188,28 @@ def debug_list_files():
         files = os.listdir(BASE_DIR)
     except Exception as e:
         files = [f"ERROR listing dir: {e}"]
-    return {"base_dir": BASE_DIR, "files": files, "tasks": load_tasks()}
+
+    cookie_status = {}
+    for platform in COOKIE_ENV_MAP:
+        path = os.path.join(COOKIES_DIR, f"{platform}.txt")
+        env_name = COOKIE_ENV_MAP[platform]
+        if os.path.exists(path):
+            stat = os.stat(path)
+            cookie_status[platform] = {
+                "env_var_set": bool(os.environ.get(env_name)),
+                "file_exists": True,
+                "size_bytes": stat.st_size,
+                "looks_valid": stat.st_size > 50,  # a real Netscape cookie file is never this small
+            }
+        else:
+            cookie_status[platform] = {
+                "env_var_set": bool(os.environ.get(env_name)),
+                "file_exists": False,
+                "size_bytes": 0,
+                "looks_valid": False,
+            }
+
+    return {"base_dir": BASE_DIR, "files": files, "cookies": cookie_status, "tasks": load_tasks()}
 
 
 @app.post("/download", dependencies=[Depends(require_api_key)])
