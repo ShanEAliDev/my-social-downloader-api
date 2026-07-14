@@ -1,5 +1,11 @@
 fastapi
 uvicorn[standard]
+# yt-dlp is intentionally left unpinned so builds pick up the latest release -
+# YouTube/TikTok/Instagram change their internals often enough that an old
+# yt-dlp silently breaks. BUT: if Railway reuses a cached build layer, it
+# won't actually re-resolve this on a redeploy. If downloads start failing
+# with format/extraction errors, bump the line below (any change invalidates
+# the cache) or use Railway's "redeploy without cache" option.
 yt-dlp
 slowapi
 python-multipart

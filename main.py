@@ -10,6 +10,7 @@ import secrets
 import subprocess
 from urllib.parse import urlparse
 
+import yt_dlp
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -126,25 +127,42 @@ def cookie_file_for_url(url: str):
 
 
 # ------------------------------------------------------------------
-# Only allow known platforms through. This is both a security
-# measure (no arbitrary-URL SSRF-style abuse of your server) and a
-# sanity check (yt-dlp will just fail loudly on garbage otherwise).
+# URL validation.
+#
+# The point isn't to restrict which platforms are allowed - yt-dlp
+# supports 1800+ sites and there's no reason to hand-maintain a list
+# that becomes stale immediately. The point is to stop this endpoint
+# being usable as an open URL-fetch proxy: without any check, someone
+# could pass http://169.254.169.254/... (cloud metadata endpoints),
+# internal network addresses, file:// URLs, etc, and yt-dlp's generic
+# extractor would happily try to fetch them - a classic SSRF risk on
+# a public endpoint.
+#
+# So instead of a fixed domain list, we ask yt-dlp itself: "do you
+# have a real, non-generic extractor for this URL?" This scales
+# automatically to everything yt-dlp supports, and still blocks
+# anything yt-dlp wouldn't recognize as an actual video/media page.
 # ------------------------------------------------------------------
-ALLOWED_DOMAINS = (
-    "youtube.com", "youtu.be",
-    "instagram.com",
-    "tiktok.com",
-    "twitter.com", "x.com",
-    "facebook.com", "fb.watch",
-)
+_YDL_FOR_CHECK = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True})
 
 
 def is_allowed_url(url: str) -> bool:
     try:
-        host = urlparse(url).netloc.lower()
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
     except Exception:
         return False
-    return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
+
+    try:
+        for ie in _YDL_FOR_CHECK._ies.values():
+            if ie.suitable(url) and ie.ie_key() not in ("Generic",):
+                return True
+    except Exception as e:
+        logger.error(f"Extractor check failed for {url}: {e}")
+        return False
+
+    return False
 
 
 # ------------------------------------------------------------------
@@ -261,7 +279,16 @@ def download_task(url: str, task_id: str, file_path: str):
         "--no-playlist",
         "--newline",
         "--merge-output-format", "mp4",
-        "-f", "best[ext=mp4]/bestvideo+bestaudio/best",
+        # bv*+ba/b: take the best available video+audio and merge, falling
+        # back to a single best combined stream if that's all there is.
+        # This matches something on virtually every video. The old
+        # "best[ext=mp4]/bestvideo+bestaudio/best" filter could match
+        # nothing if YouTube didn't expose an mp4-native combined stream
+        # for that video, which is what just happened here.
+        "-f", "bv*+ba/b",
+        # Prefer mp4/m4a when there's a choice, without hard-filtering
+        # anything out.
+        "-S", "ext:mp4:m4a",
         "-o", file_path,
         "--max-filesize", "500M",
     ]
