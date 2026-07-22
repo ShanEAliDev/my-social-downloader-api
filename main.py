@@ -4,11 +4,14 @@ import json
 import glob
 import time
 import uuid
+import stat
 import base64
 import shutil
 import logging
 import secrets
+import zipfile
 import subprocess
+import urllib.request
 from urllib.parse import urlparse
 
 import yt_dlp
@@ -118,6 +121,71 @@ if not FFMPEG_AVAILABLE:
     )
 else:
     logger.info(f"ffmpeg found via imageio-ffmpeg at: {FFMPEG_PATH}")
+
+# ------------------------------------------------------------------
+# Deno bootstrap.
+#
+# yt-dlp's current JS-challenge solver (EJS, used for YouTube's
+# "n"/nsig challenge) is built primarily around Deno. Rather than
+# requiring a nixpacks.toml / Dockerfile change to install it at the
+# OS level, we just download the Deno binary directly here at
+# startup - the same idea as imageio-ffmpeg above, just done by hand
+# since there's no pip package that bundles Deno.
+#
+# This downloads a ~30-40MB zip from Deno's GitHub releases once per
+# container start (the filesystem is ephemeral on Railway, so it
+# can't be cached across deploys/restarts - that's fine, it only
+# takes a few seconds) and adds it to PATH for this process, which
+# subprocess.Popen() calls below inherit automatically.
+# ------------------------------------------------------------------
+DENO_DIR = os.path.join(os.getcwd(), "bin")
+DENO_PATH = os.path.join(DENO_DIR, "deno")
+DENO_RELEASE_URL = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
+
+
+def ensure_deno_available() -> bool:
+    # Already on PATH (e.g. someone did install it at the OS level) - nothing to do.
+    existing = shutil.which("deno")
+    if existing:
+        logger.info(f"deno already available on PATH at: {existing}")
+        return True
+
+    # Already downloaded by us in this run.
+    if os.path.exists(DENO_PATH):
+        os.environ["PATH"] = DENO_DIR + os.pathsep + os.environ.get("PATH", "")
+        return True
+
+    try:
+        os.makedirs(DENO_DIR, exist_ok=True)
+        zip_path = os.path.join(DENO_DIR, "deno.zip")
+        logger.info(f"Downloading Deno from {DENO_RELEASE_URL} ...")
+        urllib.request.urlretrieve(DENO_RELEASE_URL, zip_path)
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(DENO_DIR)
+        os.remove(zip_path)
+
+        if not os.path.exists(DENO_PATH):
+            logger.error(f"Deno zip extracted but no 'deno' binary found in {DENO_DIR}")
+            return False
+
+        st = os.stat(DENO_PATH)
+        os.chmod(DENO_PATH, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        os.environ["PATH"] = DENO_DIR + os.pathsep + os.environ.get("PATH", "")
+        logger.info(f"Deno installed at {DENO_PATH}")
+        return True
+    except Exception as e:
+        logger.error(
+            f"Failed to auto-download Deno: {e}. YouTube nsig-challenge "
+            "solving will fall back to Node (less reliable) or fail. "
+            "Check that this container has outbound internet access to "
+            "github.com."
+        )
+        return False
+
+
+DENO_AVAILABLE = ensure_deno_available()
 
 # ------------------------------------------------------------------
 # Cookie setup
@@ -260,6 +328,7 @@ def debug_ytdlp_version():
         result["node_version"] = None
         result["node_error"] = str(e)
 
+    result["deno_auto_download_succeeded"] = DENO_AVAILABLE
     try:
         r = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=15)
         result["deno_version"] = (r.stdout.strip() or r.stderr.strip()).splitlines()[0]
@@ -267,10 +336,10 @@ def debug_ytdlp_version():
         result["deno_version"] = None
         result["deno_error"] = str(e)
         result["deno_note"] = (
-            "Deno not found. yt-dlp's current JS-challenge solver (EJS/nsig) "
-            "is built primarily around Deno - if downloads fail with "
-            "'n challenge solving failed', install Deno via nixpacks.toml "
-            "([phases.setup] nixPkgs = [\"deno\"])."
+            "Deno not found and the automatic download at startup failed "
+            "(see server logs for the reason - usually no outbound internet "
+            "access to github.com from this container). YouTube's nsig "
+            "challenge solving will fall back to Node or fail."
         )
 
     # NEW: surface ffmpeg status directly, since a missing ffmpeg is the
