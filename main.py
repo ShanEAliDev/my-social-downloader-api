@@ -260,6 +260,19 @@ def debug_ytdlp_version():
         result["node_version"] = None
         result["node_error"] = str(e)
 
+    try:
+        r = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=15)
+        result["deno_version"] = (r.stdout.strip() or r.stderr.strip()).splitlines()[0]
+    except Exception as e:
+        result["deno_version"] = None
+        result["deno_error"] = str(e)
+        result["deno_note"] = (
+            "Deno not found. yt-dlp's current JS-challenge solver (EJS/nsig) "
+            "is built primarily around Deno - if downloads fail with "
+            "'n challenge solving failed', install Deno via nixpacks.toml "
+            "([phases.setup] nixPkgs = [\"deno\"])."
+        )
+
     # NEW: surface ffmpeg status directly, since a missing ffmpeg is the
     # most common cause of "video downloaded but has no audio".
     result["ffmpeg_available"] = FFMPEG_AVAILABLE
@@ -423,7 +436,14 @@ def download_task(url: str, task_id: str, file_path: str):
             # runtime to use for YouTube's JS signature/n-parameter
             # challenge. Without a working JS runtime, YouTube formats get
             # silently dropped and every download fails.
-            "--js-runtimes", "node",
+            # yt-dlp's current JS-challenge solver (EJS, used for
+            # YouTube's "n"/nsig challenge) is built primarily around
+            # Deno - Node-only setups have been failing with
+            # "n challenge solving failed" even when Node itself works
+            # fine, per multiple yt-dlp GitHub issues from Feb-Mar 2026.
+            # Deno first, Node as a fallback for older EJS versions.
+            # Deno must be installed at the OS level - see nixpacks.toml.
+            "--js-runtimes", "deno,node",
             # Allow fetching the EJS PO-token/nsig solver scripts straight
             # from GitHub if the bundled ones are missing or out of date.
             "--remote-components", "ejs:github",
