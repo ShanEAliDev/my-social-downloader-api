@@ -374,111 +374,151 @@ def download_task(url: str, task_id: str, file_path: str):
         "file_path": file_path,
     })
 
-    cmd = [
-        "yt-dlp",
-        "--no-warnings",
-        "--no-playlist",
-        "--newline",
-        "--merge-output-format", "mp4",
-        # Prefer H.264 video + AAC audio (plays on virtually every Android
-        # device/player), falling back to any video+audio combo, then any
-        # single combined stream. The previous unconstrained "bv*+ba/b"
-        # was happily matching VP9+Opus, which is what produced files
-        # that either had no audio track after a failed merge, or played
-        # with codecs some Android players choke on even when merged.
-        "-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
-        "-S", "ext:mp4:m4a",
-        "-o", file_path,
-        "--max-filesize", "500M",
-        # The Docker image installs Node.js specifically so this has a
-        # runtime to use for YouTube's JS signature/n-parameter challenge.
-        # Without a working JS runtime, YouTube formats get silently
-        # dropped and every download fails with "format not available".
-        "--js-runtimes", "node",
-        # Belt-and-suspenders: also allow fetching the EJS solver scripts
-        # straight from GitHub if the bundled ones (from yt-dlp[default])
-        # are ever missing or out of date.
-        "--remote-components", "ejs:github",
-    ]
-
-    # imageio-ffmpeg's binary isn't on PATH, so yt-dlp needs to be told
-    # exactly where it lives or it won't be able to merge video+audio
-    # streams at all (same silent-failure mode this whole fix addresses).
-    if FFMPEG_PATH:
-        cmd += ["--ffmpeg-location", FFMPEG_PATH]
-
-    # YouTube specifically: which internal "player client" to request.
+    # ------------------------------------------------------------------
+    # YouTube client-strategy list.
     #
-    # IMPORTANT CONTEXT (YouTube anti-bot arms race, ongoing through 2025-2026):
-    # YouTube periodically forces "SABR-only" streaming for specific player
-    # clients, which makes yt-dlp receive formats it then has to discard as
-    # unusable (this is what produces "Requested format is not available"
-    # even though the video plays fine in a browser). WHICH clients are
-    # currently broken changes every few weeks as YouTube and yt-dlp go
+    # CONTEXT: YouTube periodically forces "SABR-only" streaming for
+    # specific player clients, causing yt-dlp to receive a format list
+    # where every entry is unusable ("Requested format is not available"
+    # even though the video plays fine in a browser). WHICH client(s) are
+    # currently broken shifts every few weeks as YouTube and yt-dlp go
     # back and forth - see https://github.com/yt-dlp/yt-dlp/issues/12482.
     #
-    # Rather than hardcoding a client pair here (which WILL go stale), we
-    # default to yt-dlp's own built-in client selection, which its
-    # maintainers update in every release specifically to route around
-    # whatever YouTube just changed. You can override this via the
-    # YOUTUBE_PLAYER_CLIENT env var if you need to force a specific client
-    # combo without redeploying (e.g. "android,web" or "tv,web_safari") -
-    # check /debug/yt-dlp-version and the yt-dlp GitHub issues for the
-    # current recommended value if downloads start failing again.
-    if "youtube.com" in url or "youtu.be" in url:
-        player_client = os.environ.get("YOUTUBE_PLAYER_CLIENT")
+    # There is no single client combo that stays correct for more than a
+    # few weeks at a time, so instead of picking one, we try several in
+    # order and only give up if all of them fail. Whichever one currently
+    # works differs by IP/region/YouTube A/B test, which is exactly why a
+    # multi-strategy approach is more robust than hardcoding a "best" pick.
+    #
+    # Override entirely via YOUTUBE_PLAYER_CLIENT env var (comma-separated
+    # strategies, each itself comma-separated client names, semicolon
+    # between strategies) e.g. "android,web;tv_simply,web_safari" if you
+    # find a combo that works better for your traffic and don't want to
+    # redeploy code to change it.
+    # ------------------------------------------------------------------
+    default_strategies = [None, "default", "tv_simply,web", "android,web", "web_safari,tv"]
+    env_override = os.environ.get("YOUTUBE_PLAYER_CLIENT")
+    if env_override:
+        client_strategies = [s if s else None for s in env_override.split(";")]
+    else:
+        client_strategies = default_strategies
+
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    strategies_to_try = client_strategies if is_youtube else [None]
+
+    def build_cmd(player_client: str = None) -> list:
+        c = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-playlist",
+            "--newline",
+            "--merge-output-format", "mp4",
+            # Prefer H.264 video + AAC audio (plays on virtually every
+            # Android device/player), falling back to any video+audio
+            # combo, then any single combined stream.
+            "-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
+            "-S", "ext:mp4:m4a",
+            "-o", file_path,
+            "--max-filesize", "500M",
+            # The Docker image installs Node.js specifically so this has a
+            # runtime to use for YouTube's JS signature/n-parameter
+            # challenge. Without a working JS runtime, YouTube formats get
+            # silently dropped and every download fails.
+            "--js-runtimes", "node",
+            # Allow fetching the EJS PO-token/nsig solver scripts straight
+            # from GitHub if the bundled ones are missing or out of date.
+            "--remote-components", "ejs:github",
+        ]
+        if FFMPEG_PATH:
+            c += ["--ffmpeg-location", FFMPEG_PATH]
         if player_client:
-            cmd += ["--extractor-args", f"youtube:player_client={player_client}"]
+            c += ["--extractor-args", f"youtube:player_client={player_client}"]
+        cookie_path = cookie_file_for_url(url)
+        if cookie_path:
+            c += ["--cookies", cookie_path]
+        c.append(url)
+        return c
 
     cookie_path = cookie_file_for_url(url)
     if cookie_path:
-        cmd += ["--cookies", cookie_path]
         logger.info(f"[{task_id}] Using cookies file: {cookie_path}")
     else:
         logger.info(f"[{task_id}] No cookie file for this URL, downloading unauthenticated")
 
-    cmd.append(url)
-
-    # Don't log the full command if it contains a cookies path with an
-    # account attached - fine to log the path, never log cookie contents.
-    logger.info(f"[{task_id}] Running yt-dlp (cookies={'yes' if cookie_path else 'no'}, "
-                f"ffmpeg_available={FFMPEG_AVAILABLE})")
-
     last_progress = 0
-    output_tail = []  # keep the last ~20 lines so failures are self-explanatory
+    all_attempts_output = []  # every strategy's tail, so a final failure is fully explained
     TAIL_MAX = 20
 
-    try:
+    def run_attempt(cmd: list):
+        """Runs one yt-dlp attempt. Returns (returncode, output_tail)."""
+        nonlocal last_progress
+        output_tail = []
         process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
-
         for line in process.stdout:
             line = line.rstrip()
             if not line:
                 continue
             logger.info(f"[{task_id}] yt-dlp: {line}")
-
             output_tail.append(line)
             if len(output_tail) > TAIL_MAX:
                 output_tail.pop(0)
-
             pct = parse_progress_line(line)
             if pct is not None and pct != last_progress:
                 last_progress = pct
                 save_task(task_id, {
-                    "status": "downloading",
-                    "progress": pct,
-                    "url": url,
-                    "file_path": file_path,
+                    "status": "downloading", "progress": pct,
+                    "url": url, "file_path": file_path,
                 })
-
         returncode = process.wait(timeout=300)
-        logger.info(f"[{task_id}] yt-dlp exited with code {returncode}")
+        return returncode, output_tail
+
+    # Errors worth retrying with a different client. A format-availability
+    # error is exactly the SABR/PO-token symptom this loop exists to route
+    # around. Other errors (private video, geo-block, deleted, age-gate
+    # without cookies) won't be fixed by switching clients, so we bail out
+    # immediately instead of wasting four more attempts on a lost cause.
+    RETRYABLE_MARKERS = (
+        "Requested format is not available",
+        "Only images are available for download",
+        "forcing SABR streaming",
+        "PO Token",
+    )
+
+    try:
+        final_returncode = None
+        final_tail = []
+
+        for attempt_num, strategy in enumerate(strategies_to_try, start=1):
+            cmd = build_cmd(strategy)
+            logger.info(
+                f"[{task_id}] Attempt {attempt_num}/{len(strategies_to_try)} "
+                f"(player_client={strategy or 'yt-dlp default'})"
+            )
+            save_task(task_id, {
+                "status": "downloading", "progress": last_progress,
+                "url": url, "file_path": file_path,
+            })
+
+            returncode, output_tail = run_attempt(cmd)
+            final_returncode, final_tail = returncode, output_tail
+            all_attempts_output.append(
+                f"--- attempt {attempt_num} (player_client={strategy or 'default'}) ---\n"
+                + "\n".join(output_tail)
+            )
+
+            if returncode == 0 and os.path.exists(file_path):
+                break  # success - stop trying further strategies
+
+            joined = "\n".join(output_tail)
+            should_retry = any(marker in joined for marker in RETRYABLE_MARKERS)
+            if not should_retry:
+                logger.info(f"[{task_id}] Failure doesn't look client-related, not retrying other strategies")
+                break
+            logger.info(f"[{task_id}] Attempt {attempt_num} failed with a retryable format error, trying next client strategy")
+
+        returncode = final_returncode
 
         if returncode != 0:
             # Prefer the last real ERROR line yt-dlp printed, since that's
