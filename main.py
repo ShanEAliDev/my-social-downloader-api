@@ -409,7 +409,6 @@ def download_task(url: str, task_id: str, file_path: str):
     def build_cmd(player_client: str = None) -> list:
         c = [
             "yt-dlp",
-            "--no-warnings",
             "--no-playlist",
             "--newline",
             "--merge-output-format", "mp4",
@@ -519,21 +518,36 @@ def download_task(url: str, task_id: str, file_path: str):
             logger.info(f"[{task_id}] Attempt {attempt_num} failed with a retryable format error, trying next client strategy")
 
         returncode = final_returncode
+        logger.info(f"[{task_id}] yt-dlp exited with code {returncode} after {len(all_attempts_output)} attempt(s)")
 
         if returncode != 0:
-            # Prefer the last real ERROR line yt-dlp printed, since that's
-            # almost always the actionable one (bot-check, private video,
-            # geo-block, etc). Fall back to the raw tail if none matched.
-            error_lines = [l for l in output_tail if "ERROR" in l]
-            detail = "\n".join(error_lines[-3:]) if error_lines else "\n".join(output_tail[-6:])
-            detail = detail[:1500]  # keep the status payload sane
+            # BUGFIX: this used to only look at lines containing "ERROR",
+            # but the actually-useful diagnostic for SABR/PO-token
+            # failures is logged by yt-dlp as a WARNING ("YouTube is
+            # forcing SABR streaming for this client..."), so it was
+            # silently invisible in the saved error before. Now we surface
+            # WARNING lines too, plus which client strategies were
+            # attempted, so the failure message is fully self-explanatory.
+            tail = final_tail
+            important_lines = [
+                l for l in tail
+                if ("ERROR" in l or "WARNING" in l or "SABR" in l or "PO Token" in l or "PO token" in l)
+            ]
+            detail_lines = important_lines[-5:] if important_lines else tail[-6:]
+            detail = "\n".join(detail_lines)[:1200]
+
+            strategies_tried = [s or "yt-dlp default" for s in strategies_to_try[:len(all_attempts_output)]]
+            error_msg = (
+                f"Tried {len(all_attempts_output)} client strategy(ies): {strategies_tried}. "
+                f"Last error: {detail or f'yt-dlp exited with code {returncode}, no output captured'}"
+            )
 
             save_task(task_id, {
                 "status": "failed",
                 "progress": last_progress,
                 "url": url,
                 "file_path": file_path,
-                "error": detail or f"yt-dlp exited with code {returncode}, no output captured",
+                "error": error_msg,
             })
             cleanup_task_fragments(task_id)
             return
