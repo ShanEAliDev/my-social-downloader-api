@@ -305,7 +305,8 @@ def debug_list_files():
             }
 
     return {"base_dir": BASE_DIR, "files": files, "cookies": cookie_status,
-             "ffmpeg_available": FFMPEG_AVAILABLE, "tasks": load_tasks()}
+             "ffmpeg_available": FFMPEG_AVAILABLE, "ffmpeg_path": FFMPEG_PATH,
+             "tasks": load_tasks()}
 
 
 @app.post("/download", dependencies=[Depends(require_api_key)])
@@ -406,14 +407,28 @@ def download_task(url: str, task_id: str, file_path: str):
     if FFMPEG_PATH:
         cmd += ["--ffmpeg-location", FFMPEG_PATH]
 
-    # YouTube specifically: try several internal "player clients". YouTube
-    # has been rolling out a PO Token requirement for some clients' stream
-    # URLs - when yt-dlp can't produce one, that client's formats get
-    # silently dropped, which is what causes "Requested format is not
-    # available" even though the video itself is fine. Trying multiple
-    # clients means we only need ONE of them to still work unauthenticated.
+    # YouTube specifically: which internal "player client" to request.
+    #
+    # IMPORTANT CONTEXT (YouTube anti-bot arms race, ongoing through 2025-2026):
+    # YouTube periodically forces "SABR-only" streaming for specific player
+    # clients, which makes yt-dlp receive formats it then has to discard as
+    # unusable (this is what produces "Requested format is not available"
+    # even though the video plays fine in a browser). WHICH clients are
+    # currently broken changes every few weeks as YouTube and yt-dlp go
+    # back and forth - see https://github.com/yt-dlp/yt-dlp/issues/12482.
+    #
+    # Rather than hardcoding a client pair here (which WILL go stale), we
+    # default to yt-dlp's own built-in client selection, which its
+    # maintainers update in every release specifically to route around
+    # whatever YouTube just changed. You can override this via the
+    # YOUTUBE_PLAYER_CLIENT env var if you need to force a specific client
+    # combo without redeploying (e.g. "android,web" or "tv,web_safari") -
+    # check /debug/yt-dlp-version and the yt-dlp GitHub issues for the
+    # current recommended value if downloads start failing again.
     if "youtube.com" in url or "youtu.be" in url:
-        cmd += ["--extractor-args", "youtube:player_client=web,tv"]
+        player_client = os.environ.get("YOUTUBE_PLAYER_CLIENT")
+        if player_client:
+            cmd += ["--extractor-args", f"youtube:player_client={player_client}"]
 
     cookie_path = cookie_file_for_url(url)
     if cookie_path:
