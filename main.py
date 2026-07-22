@@ -5,6 +5,7 @@ import glob
 import time
 import uuid
 import base64
+import shutil
 import logging
 import secrets
 import subprocess
@@ -75,6 +76,31 @@ TASKS_FILE = os.path.join(BASE_DIR, "tasks.json")
 
 logger.info(f"BASE_DIR resolved to: {BASE_DIR}")
 logger.info(f"COOKIES_DIR resolved to: {COOKIES_DIR}")
+
+# ------------------------------------------------------------------
+# FFmpeg presence check.
+#
+# yt-dlp needs ffmpeg to MUX separately-downloaded video and audio
+# DASH streams into one file (Instagram/YouTube/etc always serve
+# these as separate streams). Without it, yt-dlp downloads both
+# streams as loose fragment files (e.g. "<id>.fdash-....m4a" and
+# "<id>.fdash-....v.mp4") and never combines them - which is exactly
+# what produced the video-only files reported in the bug report.
+#
+# We check for it on startup and log loudly, because a missing
+# ffmpeg binary otherwise fails silently deep inside yt-dlp.
+# ------------------------------------------------------------------
+FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+if not FFMPEG_AVAILABLE:
+    logger.error(
+        "ffmpeg was NOT found on this system. Video+audio merging will fail "
+        "and downloads will silently be video-only or audio-only. "
+        "Add ffmpeg to the deployment image (e.g. nixpacks.toml "
+        "[phases.setup] aptPkgs = [\"ffmpeg\"], or apt-get install ffmpeg "
+        "in your Dockerfile)."
+    )
+else:
+    logger.info("ffmpeg found, merging is available")
 
 # ------------------------------------------------------------------
 # Cookie setup
@@ -217,6 +243,16 @@ def debug_ytdlp_version():
         result["node_version"] = None
         result["node_error"] = str(e)
 
+    # NEW: surface ffmpeg status directly, since a missing ffmpeg is the
+    # most common cause of "video downloaded but has no audio".
+    result["ffmpeg_available"] = FFMPEG_AVAILABLE
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=15)
+        result["ffmpeg_version"] = (r.stdout.strip() or r.stderr.strip()).splitlines()[0]
+    except Exception as e:
+        result["ffmpeg_version"] = None
+        result["ffmpeg_error"] = str(e)
+
     return result
 
 
@@ -247,7 +283,8 @@ def debug_list_files():
                 "looks_valid": False,
             }
 
-    return {"base_dir": BASE_DIR, "files": files, "cookies": cookie_status, "tasks": load_tasks()}
+    return {"base_dir": BASE_DIR, "files": files, "cookies": cookie_status,
+             "ffmpeg_available": FFMPEG_AVAILABLE, "tasks": load_tasks()}
 
 
 @app.post("/download", dependencies=[Depends(require_api_key)])
@@ -284,6 +321,28 @@ def parse_progress_line(line: str):
     return None
 
 
+def cleanup_task_fragments(task_id: str, keep_path: str = None):
+    """
+    Remove any leftover per-stream fragment files for this task
+    (e.g. "<task_id>.fdash-....m4a", "<task_id>.fdash-....v.mp4",
+    "<task_id>.f137.mp4", etc). These are left behind whenever a
+    merge fails to run (most commonly: ffmpeg missing) and, if not
+    cleaned up, are exactly what caused the video-only file to be
+    served in the original bug report - the old code would glob for
+    "<task_id>.*" and pick one of these arbitrarily.
+    """
+    for path in glob.glob(os.path.join(BASE_DIR, f"{task_id}.*")):
+        if path == TASKS_FILE:
+            continue
+        if keep_path and os.path.abspath(path) == os.path.abspath(keep_path):
+            continue
+        try:
+            os.remove(path)
+            logger.info(f"[{task_id}] Removed leftover fragment: {path}")
+        except Exception as e:
+            logger.warning(f"[{task_id}] Failed to remove fragment {path}: {e}")
+
+
 def download_task(url: str, task_id: str, file_path: str):
     logger.info(f"[{task_id}] download_task() started")
     save_task(task_id, {
@@ -299,15 +358,13 @@ def download_task(url: str, task_id: str, file_path: str):
         "--no-playlist",
         "--newline",
         "--merge-output-format", "mp4",
-        # bv*+ba/b: take the best available video+audio and merge, falling
-        # back to a single best combined stream if that's all there is.
-        # This matches something on virtually every video. The old
-        # "best[ext=mp4]/bestvideo+bestaudio/best" filter could match
-        # nothing if YouTube didn't expose an mp4-native combined stream
-        # for that video, which is what just happened here.
-        "-f", "bv*+ba/b",
-        # Prefer mp4/m4a when there's a choice, without hard-filtering
-        # anything out.
+        # Prefer H.264 video + AAC audio (plays on virtually every Android
+        # device/player), falling back to any video+audio combo, then any
+        # single combined stream. The previous unconstrained "bv*+ba/b"
+        # was happily matching VP9+Opus, which is what produced files
+        # that either had no audio track after a failed merge, or played
+        # with codecs some Android players choke on even when merged.
+        "-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
         "-S", "ext:mp4:m4a",
         "-o", file_path,
         "--max-filesize", "500M",
@@ -342,7 +399,8 @@ def download_task(url: str, task_id: str, file_path: str):
 
     # Don't log the full command if it contains a cookies path with an
     # account attached - fine to log the path, never log cookie contents.
-    logger.info(f"[{task_id}] Running yt-dlp (cookies={'yes' if cookie_path else 'no'})")
+    logger.info(f"[{task_id}] Running yt-dlp (cookies={'yes' if cookie_path else 'no'}, "
+                f"ffmpeg_available={FFMPEG_AVAILABLE})")
 
     last_progress = 0
     output_tail = []  # keep the last ~20 lines so failures are self-explanatory
@@ -395,39 +453,74 @@ def download_task(url: str, task_id: str, file_path: str):
                 "file_path": file_path,
                 "error": detail or f"yt-dlp exited with code {returncode}, no output captured",
             })
+            cleanup_task_fragments(task_id)
             return
 
-        actual_file = file_path if os.path.exists(file_path) else None
-        if not actual_file:
-            matches = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
-            matches = [m for m in matches if not m.endswith(".json")]
-            if matches:
-                actual_file = matches[0]
-
-        if actual_file and os.path.exists(actual_file):
-            size = os.path.getsize(actual_file)
-            logger.info(f"[{task_id}] File confirmed on disk: {actual_file} ({size} bytes)")
+        # ------------------------------------------------------------
+        # IMPORTANT: only trust the EXACT expected output path here.
+        #
+        # Previously, if the exact file was missing, the code fell back
+        # to `glob.glob(f"{task_id}.*")` and just grabbed the first
+        # match - which, when the video+audio merge fails (e.g. ffmpeg
+        # missing), returns one of the *unmerged single-stream fragment
+        # files* (like "<task_id>.fdash-....v.mp4", video only). That
+        # file would then get reported as "completed" and served to
+        # users, which is exactly the no-audio bug that was reported.
+        #
+        # Now: if the exact merged file isn't there, we treat this as a
+        # genuine failure and surface a clear, actionable error instead
+        # of silently serving a broken file.
+        # ------------------------------------------------------------
+        if os.path.exists(file_path):
+            size = os.path.getsize(file_path)
+            logger.info(f"[{task_id}] File confirmed on disk: {file_path} ({size} bytes)")
             save_task(task_id, {
                 "status": "completed",
                 "progress": 100,
                 "url": url,
-                "file_path": actual_file,
+                "file_path": file_path,
                 "download_url": f"/download-file/{task_id}",
             })
+            cleanup_task_fragments(task_id, keep_path=file_path)
         else:
-            save_task(task_id, {
-                "status": "failed",
-                "progress": last_progress,
-                "url": url,
-                "file_path": file_path,
-                "error": "yt-dlp exited 0 but no output file was found",
-            })
+            leftover = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
+            leftover = [m for m in leftover if not m.endswith(".json")]
+
+            if leftover:
+                # yt-dlp exited 0 but never produced the merged file -
+                # almost always means ffmpeg is missing or failed, and
+                # separate video/audio streams were left on disk instead.
+                error_msg = (
+                    "Video and audio downloaded as separate streams but were "
+                    "never merged into one file (this usually means ffmpeg is "
+                    "missing or failed on the server). "
+                    f"ffmpeg_available={FFMPEG_AVAILABLE}. "
+                    f"Leftover files: {[os.path.basename(m) for m in leftover]}"
+                )
+                logger.error(f"[{task_id}] {error_msg}")
+                save_task(task_id, {
+                    "status": "failed",
+                    "progress": last_progress,
+                    "url": url,
+                    "file_path": file_path,
+                    "error": error_msg,
+                })
+                cleanup_task_fragments(task_id)
+            else:
+                save_task(task_id, {
+                    "status": "failed",
+                    "progress": last_progress,
+                    "url": url,
+                    "file_path": file_path,
+                    "error": "yt-dlp exited 0 but no output file was found",
+                })
 
     except subprocess.TimeoutExpired:
         save_task(task_id, {
             "status": "failed", "progress": last_progress, "url": url,
             "file_path": file_path, "error": "timeout",
         })
+        cleanup_task_fragments(task_id)
     except FileNotFoundError as e:
         save_task(task_id, {
             "status": "failed", "progress": last_progress, "url": url,
@@ -439,6 +532,7 @@ def download_task(url: str, task_id: str, file_path: str):
             "status": "failed", "progress": last_progress, "url": url,
             "file_path": file_path, "error": str(e),
         })
+        cleanup_task_fragments(task_id)
 
 
 @app.get("/status/{task_id}", dependencies=[Depends(require_api_key)])
@@ -463,12 +557,7 @@ def file_status(task_id: str):
         return {"available": False}
 
     file_path = task.get("file_path")
-    if file_path and os.path.exists(file_path):
-        return {"available": True}
-
-    matches = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
-    matches = [m for m in matches if not m.endswith(".json")]
-    return {"available": bool(matches)}
+    return {"available": bool(file_path and os.path.exists(file_path))}
 
 
 @app.get("/download-file/{task_id}", dependencies=[Depends(require_api_key)])
@@ -486,14 +575,12 @@ def serve_file(request: Request, task_id: str):
             detail=f"File not ready. Current status: {task.get('status')}, progress: {task.get('progress')}",
         )
 
+    # Only ever serve the exact recorded merged file - never fall back to
+    # an arbitrary glob match, which is what let unmerged/video-only
+    # fragments get served to users before.
     file_path = task.get("file_path")
     if file_path and os.path.exists(file_path):
         return FileResponse(file_path, media_type="video/mp4", filename="video.mp4")
-
-    matches = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
-    matches = [m for m in matches if not m.endswith(".json")]
-    if matches:
-        return FileResponse(matches[0], media_type="video/mp4", filename="video.mp4")
 
     raise HTTPException(status_code=404, detail="File not found on disk (expired or lost on redeploy)")
 
