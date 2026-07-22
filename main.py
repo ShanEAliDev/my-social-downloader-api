@@ -12,6 +12,7 @@ import subprocess
 from urllib.parse import urlparse
 
 import yt_dlp
+import imageio_ffmpeg
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -87,20 +88,36 @@ logger.info(f"COOKIES_DIR resolved to: {COOKIES_DIR}")
 # "<id>.fdash-....v.mp4") and never combines them - which is exactly
 # what produced the video-only files reported in the bug report.
 #
-# We check for it on startup and log loudly, because a missing
-# ffmpeg binary otherwise fails silently deep inside yt-dlp.
+# Rather than relying on a system-level ffmpeg install (apt-get /
+# nixpacks.toml / Dockerfile), we use `imageio-ffmpeg`, which ships a
+# self-contained static ffmpeg binary and downloads it automatically
+# at `pip install` time - no OS package manager access needed, which
+# is convenient on platforms like Railway where you may not control
+# the build image. `imageio_ffmpeg.get_ffmpeg_exe()` returns the path
+# to that binary so we can hand it to yt-dlp explicitly via
+# --ffmpeg-location (it won't be on PATH, so yt-dlp can't find it on
+# its own).
+#
+# Make sure "imageio-ffmpeg" is in requirements.txt.
 # ------------------------------------------------------------------
-FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+try:
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    FFMPEG_AVAILABLE = bool(FFMPEG_PATH and os.path.exists(FFMPEG_PATH))
+except Exception as e:
+    FFMPEG_PATH = None
+    FFMPEG_AVAILABLE = False
+    logger.error(f"imageio_ffmpeg failed to provide an ffmpeg binary: {e}")
+
 if not FFMPEG_AVAILABLE:
     logger.error(
-        "ffmpeg was NOT found on this system. Video+audio merging will fail "
-        "and downloads will silently be video-only or audio-only. "
-        "Add ffmpeg to the deployment image (e.g. nixpacks.toml "
-        "[phases.setup] aptPkgs = [\"ffmpeg\"], or apt-get install ffmpeg "
-        "in your Dockerfile)."
+        "ffmpeg was NOT found (imageio-ffmpeg did not provide a working "
+        "binary). Video+audio merging will fail and downloads will be "
+        "video-only or audio-only. Confirm 'imageio-ffmpeg' is in "
+        "requirements.txt and that it installed successfully in the build "
+        "logs."
     )
 else:
-    logger.info("ffmpeg found, merging is available")
+    logger.info(f"ffmpeg found via imageio-ffmpeg at: {FFMPEG_PATH}")
 
 # ------------------------------------------------------------------
 # Cookie setup
@@ -246,12 +263,16 @@ def debug_ytdlp_version():
     # NEW: surface ffmpeg status directly, since a missing ffmpeg is the
     # most common cause of "video downloaded but has no audio".
     result["ffmpeg_available"] = FFMPEG_AVAILABLE
-    try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=15)
-        result["ffmpeg_version"] = (r.stdout.strip() or r.stderr.strip()).splitlines()[0]
-    except Exception as e:
+    result["ffmpeg_path"] = FFMPEG_PATH
+    if FFMPEG_PATH:
+        try:
+            r = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, timeout=15)
+            result["ffmpeg_version"] = (r.stdout.strip() or r.stderr.strip()).splitlines()[0]
+        except Exception as e:
+            result["ffmpeg_version"] = None
+            result["ffmpeg_error"] = str(e)
+    else:
         result["ffmpeg_version"] = None
-        result["ffmpeg_error"] = str(e)
 
     return result
 
@@ -378,6 +399,12 @@ def download_task(url: str, task_id: str, file_path: str):
         # are ever missing or out of date.
         "--remote-components", "ejs:github",
     ]
+
+    # imageio-ffmpeg's binary isn't on PATH, so yt-dlp needs to be told
+    # exactly where it lives or it won't be able to merge video+audio
+    # streams at all (same silent-failure mode this whole fix addresses).
+    if FFMPEG_PATH:
+        cmd += ["--ffmpeg-location", FFMPEG_PATH]
 
     # YouTube specifically: try several internal "player clients". YouTube
     # has been rolling out a PO Token requirement for some clients' stream

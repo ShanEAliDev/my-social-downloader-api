@@ -7,3 +7,4 @@ uvicorn[standard]
 yt-dlp[default]
 slowapi
 python-multipart
+imageio-ffmpeg
