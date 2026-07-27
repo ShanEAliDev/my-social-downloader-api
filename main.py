@@ -352,7 +352,7 @@ def build_quality_options(info: dict) -> list[dict]:
             res = f"{height}p"
             size = estimate_filesize(fmt, duration)
             if size is None:
-                continue
+                size = max(500_000, int((fmt.get("tbr") or 500) * 1000 * (duration or 10) / 8))
             if size > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
                 continue
             if res not in video_by_height or size > video_by_height[res]["filesize"]:
@@ -372,7 +372,7 @@ def build_quality_options(info: dict) -> list[dict]:
             std_abr = min([x for x in (320, 192, 128) if x <= abr_int], default=abr_int)
             size = estimate_filesize(fmt, duration)
             if size is None:
-                continue
+                size = max(200_000, int(abr_int * 1000 * (duration or 10) / 8))
             if size > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
                 continue
             key = f"mp3-{std_abr}"
@@ -731,6 +731,16 @@ async def start_download(request: Request, body: DownloadRequest, background_tas
             if q["id"] == body.quality:
                 fmt = q
                 break
+            if q["type"] == "video" and str(q.get("height", "")) == body.quality:
+                fmt = q
+                break
+            try:
+                if q["type"] == "video" and body.quality.endswith("p"):
+                    if int(q.get("height", 0)) <= int(body.quality[:-1]):
+                        fmt = q
+                        break
+            except (ValueError, TypeError):
+                pass
     else:
         video_opts = [q for q in raw_qualities if q["type"] == "video"]
         audio_opts = [q for q in raw_qualities if q["type"] == "audio"]
