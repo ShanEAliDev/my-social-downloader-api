@@ -12,6 +12,9 @@ import secrets
 import zipfile
 import subprocess
 import urllib.request
+import random
+import threading
+import asyncio
 from urllib.parse import urlparse
 
 import yt_dlp
@@ -195,6 +198,7 @@ DENO_AVAILABLE = ensure_deno_available()
 #
 #   base64 -w0 www.youtube.com_cookies.txt   -> paste into YOUTUBE_COOKIES_B64
 #   base64 -w0 www.instagram.com_cookies.txt -> paste into INSTAGRAM_COOKIES_B64
+#   base64 -w0 www.tiktok.com_cookies.txt    -> paste into TIKTOK_COOKIES_B64
 #
 # On startup we decode those env vars back into real files inside the
 # container (which lives only as long as the deploy - nothing persists
@@ -203,6 +207,7 @@ DENO_AVAILABLE = ensure_deno_available()
 COOKIE_ENV_MAP = {
     "youtube": "YOUTUBE_COOKIES_B64",
     "instagram": "INSTAGRAM_COOKIES_B64",
+    "tiktok": "TIKTOK_COOKIES_B64",
 }
 
 
@@ -232,9 +237,236 @@ def cookie_file_for_url(url: str):
         path = os.path.join(COOKIES_DIR, "youtube.txt")
     elif "instagram.com" in host:
         path = os.path.join(COOKIES_DIR, "instagram.txt")
+    elif "tiktok.com" in host:
+        path = os.path.join(COOKIES_DIR, "tiktok.txt")
     else:
         return None
     return path if os.path.exists(path) else None
+
+
+AUTO_DELETE_SECONDS = int(os.environ.get("DOWNLOAD_EXPIRY_SECONDS", os.environ.get("AUTO_DELETE_SECONDS", "1500")))
+MAX_DOWNLOAD_SIZE_MB = int(os.environ.get("MAX_DOWNLOAD_SIZE_MB", "500"))
+DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "1"))
+METADATA_CACHE_SECONDS = int(os.environ.get("METADATA_CACHE_SECONDS", "300"))
+DISK_SAFETY_BUFFER_MB = int(os.environ.get("DISK_SAFETY_BUFFER_MB", "100"))
+DISK_SAFETY_BUFFER_BYTES = DISK_SAFETY_BUFFER_MB * 1024 * 1024
+
+
+# ------------------------------------------------------------------
+# Download queue / concurrency control
+# ------------------------------------------------------------------
+_download_counter = 0
+_download_condition = threading.Condition()
+
+
+def _acquire_download_slot():
+    with _download_condition:
+        while _download_counter >= DOWNLOAD_CONCURRENCY:
+            _download_condition.wait()
+        _download_counter += 1
+
+
+def _release_download_slot():
+    with _download_condition:
+        _download_counter -= 1
+        _download_condition.notify_all()
+
+
+# ------------------------------------------------------------------
+# Metadata cache
+# ------------------------------------------------------------------
+_metadata_cache = {}
+_metadata_cache_lock = threading.Lock()
+
+
+def get_cached_metadata(url: str):
+    with _metadata_cache_lock:
+        entry = _metadata_cache.get(url)
+        if entry:
+            ts, info = entry
+            if time.time() - ts < METADATA_CACHE_SECONDS:
+                return info
+            del _metadata_cache[url]
+    return None
+
+
+def set_cached_metadata(url: str, info: dict):
+    with _metadata_cache_lock:
+        _metadata_cache[url] = (time.time(), info)
+
+
+# ------------------------------------------------------------------
+# Metadata extraction
+# ------------------------------------------------------------------
+def fetch_metadata(url: str) -> dict:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "no_playlist": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info:
+        raise ValueError("Could not extract metadata")
+
+    return info
+
+
+def estimate_filesize(fmt: dict, duration: float) -> int | None:
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return int(size)
+
+    tbr = fmt.get("tbr")
+    if tbr and duration and duration > 0:
+        return int(tbr * 1000 * duration / 8)
+
+    vbr = fmt.get("vbr") or 0
+    abr = fmt.get("abr") or 0
+    if (vbr or abr) and duration and duration > 0:
+        return int((vbr + abr) * 1000 * duration / 8)
+
+    return None
+
+
+def build_quality_options(info: dict) -> list[dict]:
+    formats = info.get("formats", [])
+    duration = info.get("duration") or 0
+    video_by_height = {}
+    audio_by_bitrate = {}
+
+    for fmt in formats:
+        fmt_id = fmt.get("format_id")
+        if not fmt_id:
+            continue
+
+        vcodec = fmt.get("vcodec", "none")
+        acodec = fmt.get("acodec", "none")
+
+        if vcodec != "none":
+            height = fmt.get("height")
+            if not height:
+                continue
+            res = f"{height}p"
+            size = estimate_filesize(fmt, duration)
+            if size is None:
+                continue
+            if size > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
+                continue
+            if res not in video_by_height or size > video_by_height[res]["filesize"]:
+                video_by_height[res] = {
+                    "id": res,
+                    "label": res,
+                    "type": "video",
+                    "height": height,
+                    "filesize": size,
+                    "format_id": fmt_id,
+                }
+        elif acodec != "none":
+            abr = fmt.get("abr") or fmt.get("audio_bitrate")
+            if abr is None:
+                continue
+            abr_int = int(abr)
+            std_abr = min([x for x in (320, 192, 128) if x <= abr_int], default=abr_int)
+            size = estimate_filesize(fmt, duration)
+            if size is None:
+                continue
+            if size > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
+                continue
+            key = f"mp3-{std_abr}"
+            if key not in audio_by_bitrate or size > audio_by_bitrate[key]["filesize"]:
+                audio_by_bitrate[key] = {
+                    "id": key,
+                    "label": f"MP3 {std_abr} kbps",
+                    "type": "audio",
+                    "bitrate": std_abr,
+                    "filesize": size,
+                    "format_id": fmt_id,
+                }
+
+    video_list = sorted(video_by_height.values(), key=lambda x: x.get("height", 0), reverse=True)
+    audio_list = sorted(audio_by_bitrate.values(), key=lambda x: x.get("bitrate", 0), reverse=True)
+    all_opts = video_list + audio_list
+
+    if all_opts:
+        all_opts[0]["recommended"] = True
+
+    return all_opts
+
+
+def format_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+
+def build_frontend_qualities(qualities: list[dict]) -> list[dict]:
+    result = []
+    for q in qualities:
+        entry = {
+            "id": q["id"],
+            "label": q["label"],
+            "type": q["type"],
+            "estimated_size": format_bytes(q["filesize"]),
+        }
+        if q.get("recommended"):
+            entry["recommended"] = True
+        result.append(entry)
+    return result
+
+
+# ------------------------------------------------------------------
+# Disk space management
+# ------------------------------------------------------------------
+def ensure_disk_space(required_bytes: int, media_type: str = "video") -> bool:
+    usage = shutil.disk_usage(BASE_DIR)
+    free = usage.free
+
+    if media_type == "audio":
+        target = required_bytes + DISK_SAFETY_BUFFER_BYTES // 2
+    else:
+        target = required_bytes * 2 + DISK_SAFETY_BUFFER_BYTES
+
+    if free >= target:
+        return True
+
+    logger.warning(f"Low disk space: need {target}, have {free}. Cleaning up old files...")
+
+    for _ in range(5):
+        tasks = load_tasks()
+        completed_files = []
+        for task_id, task in tasks.items():
+            if task.get("status") == "completed":
+                fp = task.get("file_path")
+                if fp and os.path.exists(fp):
+                    completed_files.append((task.get("created_at", 0), fp, task_id))
+
+        completed_files.sort(key=lambda x: x[0])
+
+        for created_at, fp, task_id in completed_files:
+            try:
+                size = os.path.getsize(fp)
+                os.remove(fp)
+                logger.info(f"Deleted old file to free space: {fp} ({size} bytes)")
+                free += size
+                if free >= target:
+                    return True
+            except Exception as e:
+                logger.warning(f"Failed to delete {fp}: {e}")
+
+        cleanup_old_files()
+        usage = shutil.disk_usage(BASE_DIR)
+        free = usage.free
+        if free >= target:
+            return True
+
+    return free >= target
 
 
 # ------------------------------------------------------------------
@@ -304,11 +536,69 @@ def save_task(task_id: str, data: dict):
 
 class DownloadRequest(BaseModel):
     url: str
+    media_type: str = "video"
+    quality: str = None
+
+
+class FrontendQuality(BaseModel):
+    id: str
+    label: str
+    type: str
+    estimated_size: str
+    recommended: bool = False
+
+
+class MetadataRequest(BaseModel):
+    url: str
+
+
+class MetadataResponse(BaseModel):
+    title: str
+    thumbnail: str
+    duration: int
+    qualities: list[FrontendQuality]
 
 
 @app.get("/")
 def home():
     return {"message": "API Working"}
+
+
+@app.post("/get-metadata", dependencies=[Depends(require_api_key)])
+@limiter.limit("10/minute")
+async def get_metadata(request: Request, body: MetadataRequest):
+    if not is_allowed_url(body.url):
+        raise HTTPException(status_code=400, detail="URL host is not supported")
+
+    cached = get_cached_metadata(body.url)
+    if cached:
+        info = cached
+    else:
+        try:
+            info = fetch_metadata(body.url)
+        except Exception as e:
+            logger.error(f"Metadata fetch failed for {body.url}: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {e}")
+        set_cached_metadata(body.url, info)
+
+    thumbnail = ""
+    if info.get("thumbnail"):
+        thumbnail = info["thumbnail"]
+    elif info.get("thumbnails"):
+        thumbnails = info["thumbnails"]
+        if thumbnails:
+            thumbnail = thumbnails[-1].get("url", "")
+
+    duration = int(info.get("duration") or 0)
+    raw_qualities = build_quality_options(info)
+    frontend_qualities = build_frontend_qualities(raw_qualities)
+
+    return MetadataResponse(
+        title=info.get("title", ""),
+        thumbnail=thumbnail,
+        duration=duration,
+        qualities=[FrontendQuality(**q) for q in frontend_qualities],
+    )
 
 
 @app.get("/debug/yt-dlp-version", dependencies=[Depends(require_api_key)])
@@ -397,21 +687,84 @@ async def start_download(request: Request, body: DownloadRequest, background_tas
     if not is_allowed_url(body.url):
         raise HTTPException(status_code=400, detail="URL host is not supported")
 
+    if body.media_type not in ("video", "audio"):
+        raise HTTPException(status_code=400, detail="media_type must be 'video' or 'audio'")
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _acquire_download_slot)
+
     cleanup_old_files()
 
     task_id = str(uuid.uuid4())[:12]
-    file_path = os.path.join(BASE_DIR, f"{task_id}.mp4")
+    ext = ".mp3" if body.media_type == "audio" else ".mp4"
+    file_path = os.path.join(BASE_DIR, f"{task_id}{ext}")
 
-    logger.info(f"[{task_id}] New download requested. url={body.url}")
+    logger.info(f"[{task_id}] New download requested. url={body.url} media_type={body.media_type} quality={body.quality}")
+
+    created_at = time.time()
+    auto_delete_seconds = random.randint(1200, 1800)
 
     save_task(task_id, {
         "status": "started",
         "progress": 0,
         "url": body.url,
         "file_path": file_path,
+        "media_type": body.media_type,
+        "created_at": created_at,
+        "auto_delete_seconds": auto_delete_seconds,
     })
 
-    background_tasks.add_task(download_task, body.url, task_id, file_path)
+    info = get_cached_metadata(body.url)
+    if not info:
+        try:
+            info = fetch_metadata(body.url)
+            set_cached_metadata(body.url, info)
+        except Exception as e:
+            _release_download_slot()
+            logger.warning(f"[{task_id}] Metadata fetch failed: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {e}")
+
+    fmt = None
+    raw_qualities = build_quality_options(info)
+    if body.quality:
+        for q in raw_qualities:
+            if q["id"] == body.quality:
+                fmt = q
+                break
+    else:
+        video_opts = [q for q in raw_qualities if q["type"] == "video"]
+        audio_opts = [q for q in raw_qualities if q["type"] == "audio"]
+        candidates = video_opts if body.media_type == "video" else audio_opts
+        if candidates:
+            fmt = candidates[0]
+
+    required_bytes = 0
+    if fmt:
+        required_bytes = fmt.get("filesize") or 0
+
+    if required_bytes <= 0:
+        _release_download_slot()
+        raise HTTPException(status_code=400, detail="Unable to estimate download size")
+
+    media_type = body.media_type
+    if media_type == "audio":
+        target = required_bytes + DISK_SAFETY_BUFFER_BYTES // 2
+    else:
+        target = required_bytes * 2 + DISK_SAFETY_BUFFER_BYTES
+
+    for _ in range(5):
+        if ensure_disk_space(required_bytes, media_type):
+            break
+        logger.warning(f"[{task_id}] Disk space still insufficient after cleanup, retrying...")
+        time.sleep(1)
+    else:
+        _release_download_slot()
+        raise HTTPException(
+            status_code=507,
+            detail="Server storage is temporarily full. Please try again later."
+        )
+
+    background_tasks.add_task(download_task, body.url, task_id, file_path, media_type, body.quality)
     return {"task_id": task_id, "status": "started", "message": "Download started"}
 
 
@@ -447,14 +800,70 @@ def cleanup_task_fragments(task_id: str, keep_path: str = None):
             logger.warning(f"[{task_id}] Failed to remove fragment {path}: {e}")
 
 
-def download_task(url: str, task_id: str, file_path: str):
-    logger.info(f"[{task_id}] download_task() started")
-    save_task(task_id, {
+def download_task(url: str, task_id: str, file_path: str, media_type: str = "video", quality: str = None):
+    logger.info(f"[{task_id}] download_task() started media_type={media_type} quality={quality}")
+
+    existing = load_tasks().get(task_id, {})
+    existing.update({
         "status": "downloading",
         "progress": 0,
         "url": url,
         "file_path": file_path,
+        "media_type": media_type,
     })
+    save_task(task_id, existing)
+
+    def _persist(**updates):
+        current = load_tasks().get(task_id, {})
+        current.update(updates)
+        save_task(task_id, current)
+
+    def build_cmd(player_client: str = None) -> list:
+            c = [
+                "yt-dlp",
+                "--no-playlist",
+                "--newline",
+                "-o", file_path,
+                "--max-filesize", "500M",
+                "--js-runtimes", "deno,node",
+                "--remote-components", "ejs:github",
+            ]
+            if FFMPEG_PATH:
+                c += ["--ffmpeg-location", FFMPEG_PATH]
+            if player_client:
+                c += ["--extractor-args", f"youtube:player_client={player_client}"]
+            cookie_path = cookie_file_for_url(url)
+            if cookie_path:
+                c += ["--cookies", cookie_path]
+
+            if media_type == "audio":
+                c += [
+                    "--extract-audio",
+                    "--audio-format", "mp3",
+                ]
+                if quality and quality.startswith("mp3-"):
+                    c += ["--audio-quality", quality.split("-")[1] + "K"]
+                else:
+                    c += ["--audio-quality", "0"]
+                c += ["-f", "bestaudio"]
+            else:
+                c += [
+                    "--merge-output-format", "mp4",
+                ]
+                if quality and quality.endswith("p"):
+                    try:
+                        height = int(quality[:-1])
+                        c += [
+                            "-f", f"bv*[height<={height}][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<={height}]+ba/b",
+                        ]
+                    except ValueError:
+                        c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b"]
+                else:
+                    c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b"]
+                c += ["-S", "ext:mp4:m4a"]
+
+            c.append(url)
+            return c
 
     # ------------------------------------------------------------------
     # YouTube client-strategy list.
@@ -488,45 +897,6 @@ def download_task(url: str, task_id: str, file_path: str):
     is_youtube = "youtube.com" in url or "youtu.be" in url
     strategies_to_try = client_strategies if is_youtube else [None]
 
-    def build_cmd(player_client: str = None) -> list:
-        c = [
-            "yt-dlp",
-            "--no-playlist",
-            "--newline",
-            "--merge-output-format", "mp4",
-            # Prefer H.264 video + AAC audio (plays on virtually every
-            # Android device/player), falling back to any video+audio
-            # combo, then any single combined stream.
-            "-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
-            "-S", "ext:mp4:m4a",
-            "-o", file_path,
-            "--max-filesize", "500M",
-            # The Docker image installs Node.js specifically so this has a
-            # runtime to use for YouTube's JS signature/n-parameter
-            # challenge. Without a working JS runtime, YouTube formats get
-            # silently dropped and every download fails.
-            # yt-dlp's current JS-challenge solver (EJS, used for
-            # YouTube's "n"/nsig challenge) is built primarily around
-            # Deno - Node-only setups have been failing with
-            # "n challenge solving failed" even when Node itself works
-            # fine, per multiple yt-dlp GitHub issues from Feb-Mar 2026.
-            # Deno first, Node as a fallback for older EJS versions.
-            # Deno must be installed at the OS level - see nixpacks.toml.
-            "--js-runtimes", "deno,node",
-            # Allow fetching the EJS PO-token/nsig solver scripts straight
-            # from GitHub if the bundled ones are missing or out of date.
-            "--remote-components", "ejs:github",
-        ]
-        if FFMPEG_PATH:
-            c += ["--ffmpeg-location", FFMPEG_PATH]
-        if player_client:
-            c += ["--extractor-args", f"youtube:player_client={player_client}"]
-        cookie_path = cookie_file_for_url(url)
-        if cookie_path:
-            c += ["--cookies", cookie_path]
-        c.append(url)
-        return c
-
     cookie_path = cookie_file_for_url(url)
     if cookie_path:
         logger.info(f"[{task_id}] Using cookies file: {cookie_path}")
@@ -555,18 +925,10 @@ def download_task(url: str, task_id: str, file_path: str):
             pct = parse_progress_line(line)
             if pct is not None and pct != last_progress:
                 last_progress = pct
-                save_task(task_id, {
-                    "status": "downloading", "progress": pct,
-                    "url": url, "file_path": file_path,
-                })
+                _persist(status="downloading", progress=pct, url=url, file_path=file_path)
         returncode = process.wait(timeout=300)
         return returncode, output_tail
 
-    # Errors worth retrying with a different client. A format-availability
-    # error is exactly the SABR/PO-token symptom this loop exists to route
-    # around. Other errors (private video, geo-block, deleted, age-gate
-    # without cookies) won't be fixed by switching clients, so we bail out
-    # immediately instead of wasting four more attempts on a lost cause.
     RETRYABLE_MARKERS = (
         "Requested format is not available",
         "Only images are available for download",
@@ -584,10 +946,7 @@ def download_task(url: str, task_id: str, file_path: str):
                 f"[{task_id}] Attempt {attempt_num}/{len(strategies_to_try)} "
                 f"(player_client={strategy or 'yt-dlp default'})"
             )
-            save_task(task_id, {
-                "status": "downloading", "progress": last_progress,
-                "url": url, "file_path": file_path,
-            })
+            _persist(status="downloading", progress=last_progress, url=url, file_path=file_path)
 
             returncode, output_tail = run_attempt(cmd)
             final_returncode, final_tail = returncode, output_tail
@@ -631,13 +990,7 @@ def download_task(url: str, task_id: str, file_path: str):
                 f"Last error: {detail or f'yt-dlp exited with code {returncode}, no output captured'}"
             )
 
-            save_task(task_id, {
-                "status": "failed",
-                "progress": last_progress,
-                "url": url,
-                "file_path": file_path,
-                "error": error_msg,
-            })
+            _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=error_msg)
             cleanup_task_fragments(task_id)
             return
 
@@ -659,13 +1012,7 @@ def download_task(url: str, task_id: str, file_path: str):
         if os.path.exists(file_path):
             size = os.path.getsize(file_path)
             logger.info(f"[{task_id}] File confirmed on disk: {file_path} ({size} bytes)")
-            save_task(task_id, {
-                "status": "completed",
-                "progress": 100,
-                "url": url,
-                "file_path": file_path,
-                "download_url": f"/download-file/{task_id}",
-            })
+            _persist(status="completed", progress=100, url=url, file_path=file_path, download_url=f"/download-file/{task_id}")
             cleanup_task_fragments(task_id, keep_path=file_path)
         else:
             leftover = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
@@ -683,41 +1030,22 @@ def download_task(url: str, task_id: str, file_path: str):
                     f"Leftover files: {[os.path.basename(m) for m in leftover]}"
                 )
                 logger.error(f"[{task_id}] {error_msg}")
-                save_task(task_id, {
-                    "status": "failed",
-                    "progress": last_progress,
-                    "url": url,
-                    "file_path": file_path,
-                    "error": error_msg,
-                })
+                _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=error_msg)
                 cleanup_task_fragments(task_id)
             else:
-                save_task(task_id, {
-                    "status": "failed",
-                    "progress": last_progress,
-                    "url": url,
-                    "file_path": file_path,
-                    "error": "yt-dlp exited 0 but no output file was found",
-                })
+                _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error="yt-dlp exited 0 but no output file was found")
 
     except subprocess.TimeoutExpired:
-        save_task(task_id, {
-            "status": "failed", "progress": last_progress, "url": url,
-            "file_path": file_path, "error": "timeout",
-        })
+        _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error="timeout")
         cleanup_task_fragments(task_id)
     except FileNotFoundError as e:
-        save_task(task_id, {
-            "status": "failed", "progress": last_progress, "url": url,
-            "file_path": file_path, "error": f"yt-dlp not found on server: {e}",
-        })
+        _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=f"yt-dlp not found on server: {e}")
     except Exception as e:
         logger.exception(f"[{task_id}] Unexpected exception in download_task")
-        save_task(task_id, {
-            "status": "failed", "progress": last_progress, "url": url,
-            "file_path": file_path, "error": str(e),
-        })
+        _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=str(e))
         cleanup_task_fragments(task_id)
+    finally:
+        _release_download_slot()
 
 
 @app.get("/status/{task_id}", dependencies=[Depends(require_api_key)])
@@ -765,6 +1093,9 @@ def serve_file(request: Request, task_id: str):
     # fragments get served to users before.
     file_path = task.get("file_path")
     if file_path and os.path.exists(file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".mp3":
+            return FileResponse(file_path, media_type="audio/mpeg", filename="audio.mp3")
         return FileResponse(file_path, media_type="video/mp4", filename="video.mp4")
 
     raise HTTPException(status_code=404, detail="File not found on disk (expired or lost on redeploy)")
@@ -779,13 +1110,39 @@ MAX_FILE_AGE_HOURS = float(os.environ.get("MAX_FILE_AGE_HOURS", "2"))
 
 
 def cleanup_old_files():
-    cutoff = time.time() - (MAX_FILE_AGE_HOURS * 3600)
+    now = time.time()
+    tasks = load_tasks()
+
+    for task_id, task in tasks.items():
+        status = task.get("status")
+        created_at = task.get("created_at", now)
+        auto_delete_seconds = task.get("auto_delete_seconds", AUTO_DELETE_SECONDS)
+        file_path = task.get("file_path")
+
+        if status == "completed" and file_path and os.path.exists(file_path):
+            if now - created_at > auto_delete_seconds:
+                try:
+                    size = os.path.getsize(file_path)
+                    os.remove(file_path)
+                    logger.info(f"Auto-deleted completed file after timeout: {file_path} ({size} bytes)")
+                    task["status"] = "expired"
+                    save_task(task_id, task)
+                except Exception as e:
+                    logger.warning(f"Auto-delete failed for {file_path}: {e}")
+        elif status not in ("completed", "expired") and file_path and os.path.exists(file_path):
+            try:
+                if os.path.getmtime(file_path) < now - (MAX_FILE_AGE_HOURS * 3600):
+                    os.remove(file_path)
+                    logger.info(f"Cleaned up old non-completed file: {file_path}")
+            except Exception as e:
+                logger.warning(f"Cleanup failed for {file_path}: {e}")
+
     for path in glob.glob(os.path.join(BASE_DIR, "*")):
         if path == TASKS_FILE:
             continue
         try:
-            if os.path.getmtime(path) < cutoff:
+            if os.path.getmtime(path) < now - (MAX_FILE_AGE_HOURS * 3600):
                 os.remove(path)
-                logger.info(f"Cleaned up old file: {path}")
+                logger.info(f"Cleaned up old orphaned file: {path}")
         except Exception as e:
-            logger.warning(f"Cleanup failed for {path}: {e}")
+            logger.warning(f"Cleanup failed for orphaned {path}: {e}")
