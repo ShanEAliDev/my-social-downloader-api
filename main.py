@@ -260,6 +260,7 @@ _download_condition = threading.Condition()
 
 
 def _acquire_download_slot():
+    global _download_counter
     with _download_condition:
         while _download_counter >= DOWNLOAD_CONCURRENCY:
             _download_condition.wait()
@@ -267,6 +268,7 @@ def _acquire_download_slot():
 
 
 def _release_download_slot():
+    global _download_counter
     with _download_condition:
         _download_counter -= 1
         _download_condition.notify_all()
