@@ -390,6 +390,19 @@ def build_quality_options(info: dict) -> list[dict]:
 
     video_list = sorted(video_by_height.values(), key=lambda x: x.get("height", 0), reverse=True)
     audio_list = sorted(audio_by_bitrate.values(), key=lambda x: x.get("bitrate", 0), reverse=True)
+
+    if not audio_list:
+        for std_abr in (320, 192, 128):
+            size_est = max(200_000, int(std_abr * 1000 * (duration or 10) / 8))
+            audio_list.append({
+                "id": f"mp3-{std_abr}",
+                "label": f"MP3 {std_abr} kbps",
+                "type": "audio",
+                "bitrate": std_abr,
+                "filesize": size_est,
+                "format_id": None,
+            })
+
     all_opts = video_list + audio_list
 
     if all_opts:
@@ -857,7 +870,7 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                     c += ["--audio-quality", quality.split("-")[1] + "K"]
                 else:
                     c += ["--audio-quality", "0"]
-                c += ["-f", "bestaudio"]
+                c += ["-f", "bestaudio/best"]
             else:
                 c += [
                     "--merge-output-format", "mp4",
