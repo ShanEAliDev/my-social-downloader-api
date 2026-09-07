@@ -244,6 +244,36 @@ def cookie_file_for_url(url: str):
     return path if os.path.exists(path) else None
 
 
+FACEBOOK_SHARE_RE = re.compile(r'facebook\.com/share/', re.I)
+
+
+def resolve_redirect_url(url: str, timeout: int = 10) -> str:
+    """
+    Follows HTTP redirects and returns the final URL. Used for share-link
+    formats (e.g. facebook.com/share/v/...) that only match yt-dlp's
+    Generic extractor before redirecting to a real, extractor-supported
+    URL. is_allowed_url() intentionally excludes Generic matches (SSRF
+    protection), so we resolve first and validate the real destination.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.geturl()
+
+
+def normalize_url(url: str) -> str:
+    """Resolve share-link redirects to their real destination before
+    validation/extraction, so URLs that only look valid via yt-dlp's
+    Generic extractor (which is deliberately excluded from
+    is_allowed_url for SSRF safety) get a fair check against their
+    real target."""
+    if FACEBOOK_SHARE_RE.search(url):
+        try:
+            return resolve_redirect_url(url)
+        except Exception as e:
+            logger.warning(f"Failed to resolve redirect for {url}: {e}")
+    return url
+
+
 AUTO_DELETE_SECONDS = int(os.environ.get("DOWNLOAD_EXPIRY_SECONDS", os.environ.get("AUTO_DELETE_SECONDS", "1500")))
 MAX_DOWNLOAD_SIZE_MB = int(os.environ.get("MAX_DOWNLOAD_SIZE_MB", "500"))
 DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "1"))
@@ -505,6 +535,7 @@ _YDL_FOR_CHECK = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True})
 
 
 def is_allowed_url(url: str) -> bool:
+    url = normalize_url(url)
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -582,6 +613,7 @@ def home():
 @app.post("/get-metadata", dependencies=[Depends(require_api_key)])
 @limiter.limit("10/minute")
 async def get_metadata(request: Request, body: MetadataRequest):
+    body.url = normalize_url(body.url)
     if not is_allowed_url(body.url):
         raise HTTPException(status_code=400, detail="URL host is not supported")
 
@@ -699,6 +731,7 @@ def debug_list_files():
 @app.post("/download", dependencies=[Depends(require_api_key)])
 @limiter.limit("5/minute")
 async def start_download(request: Request, body: DownloadRequest, background_tasks: BackgroundTasks):
+    body.url = normalize_url(body.url)
     if not is_allowed_url(body.url):
         raise HTTPException(status_code=400, detail="URL host is not supported")
 
