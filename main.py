@@ -561,13 +561,18 @@ def is_allowed_url(url: str) -> bool:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             return False
-        netloc = parsed.netloc.lower()
     except Exception:
         return False
 
+    # Cache by full URL, not netloc. Caching by netloc broke SSRF
+    # protection: a valid Instagram Reel would permanently whitelist
+    # ALL www.instagram.com paths — including malformed or unintended
+    # ones — for the lifetime of the worker process, because the cache
+    # hit returned early before ie.suitable(url) could check them.
     with _allowed_url_lock:
-        if netloc in _allowed_url_cache:
-            return _allowed_url_cache[netloc]
+        cached = _allowed_url_cache.get(url)
+        if cached is not None:
+            return cached
 
     allowed = False
     try:
@@ -580,66 +585,65 @@ def is_allowed_url(url: str) -> bool:
         return False
 
     with _allowed_url_lock:
-        _allowed_url_cache[netloc] = allowed
+        _allowed_url_cache[url] = allowed
 
     return allowed
 
 
 # ------------------------------------------------------------------
-# Task persistence (in-memory cache with periodic / status-based JSON sync)
+# Task persistence — always read/write tasks.json directly.
+#
+# A previous version used an in-memory dict (_tasks_cache) as the
+# primary store and only flushed to disk on significant progress
+# jumps. That is BROKEN under gunicorn multi-worker mode: each worker
+# is a separate OS process with its own Python heap, so the cache is
+# not shared. Whichever worker handles a /status poll may never have
+# seen the task (or holds a stale snapshot), producing intermittent
+# 404s and frozen-progress responses even while the download is
+# running fine in another worker. The simplest correct fix is to
+# remove the cache entirely and always go to disk — at low request
+# volumes this is not a bottleneck.
 # ------------------------------------------------------------------
-_tasks_cache = {}
-_tasks_cache_loaded = False
 _tasks_lock = threading.Lock()
 
 
 def load_tasks() -> dict:
-    global _tasks_cache, _tasks_cache_loaded
     with _tasks_lock:
-        if not _tasks_cache_loaded:
-            if os.path.exists(TASKS_FILE):
-                try:
-                    with open(TASKS_FILE, "r") as f:
-                        _tasks_cache = json.load(f)
-                except Exception as e:
-                    logger.error(f"Failed to load tasks.json: {e}")
-                    _tasks_cache = {}
-            _tasks_cache_loaded = True
-        return dict(_tasks_cache)
+        if os.path.exists(TASKS_FILE):
+            try:
+                with open(TASKS_FILE, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load tasks.json: {e}")
+        return {}
 
 
 def save_task(task_id: str, data: dict, force_disk: bool = False):
-    global _tasks_cache
     with _tasks_lock:
-        if not _tasks_cache_loaded:
-            load_tasks()
+        # Always read the latest state from disk first so we don't
+        # overwrite updates made by other workers.
+        try:
+            if os.path.exists(TASKS_FILE):
+                with open(TASKS_FILE, "r") as f:
+                    all_tasks = json.load(f)
+            else:
+                all_tasks = {}
+        except Exception as e:
+            logger.error(f"[{task_id}] Failed to read tasks.json before save: {e}")
+            all_tasks = {}
 
-        prev = _tasks_cache.get(task_id, {})
+        prev = all_tasks.get(task_id, {})
         updated = dict(prev)
         updated.update(data)
-        _tasks_cache[task_id] = updated
+        all_tasks[task_id] = updated
 
-        prev_status = prev.get("status")
-        curr_status = updated.get("status")
-        prev_prog = prev.get("progress", 0)
-        curr_prog = updated.get("progress", 0)
-
-        # Sync to disk on status changes, completed/failed, or >= 10% progress steps to reduce disk I/O
-        should_write = (
-            force_disk or
-            prev_status != curr_status or
-            abs(curr_prog - prev_prog) >= 10 or
-            curr_prog in (0, 100)
-        )
-
-        if should_write:
-            try:
-                with open(TASKS_FILE, "w") as f:
-                    json.dump(_tasks_cache, f)
-                logger.info(f"[{task_id}] status saved -> {updated.get('status')} "
-                            f"progress={updated.get('progress')}")
-            except Exception as e:
-                logger.error(f"[{task_id}] Failed to save tasks.json: {e}")
+        try:
+            with open(TASKS_FILE, "w") as f:
+                json.dump(all_tasks, f)
+            logger.info(f"[{task_id}] status saved -> {updated.get('status')} "
+                        f"progress={updated.get('progress')}")
+        except Exception as e:
+            logger.error(f"[{task_id}] Failed to save tasks.json: {e}")
 
 
 class DownloadRequest(BaseModel):
@@ -932,20 +936,13 @@ def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
         if "h264" in info_lower or "h.264" in info_lower or "avc" in info_lower or "mp4v" in info_lower or "mpeg4" in info_lower:
             return file_path, 0.0
 
-        # For large high-res files (>50 MB), serving the downloaded MP4 directly
-        # avoids 50s CPU transcoding bottlenecks while preserving immediate delivery.
-        size_bytes = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-        if size_bytes > 50 * 1024 * 1024:
-            logger.info(f"[{task_id}] Large video file ({size_bytes} bytes), serving directly without CPU transcode for speed")
-            return file_path, 0.0
-
         logger.info(f"[{task_id}] Non-H.264 video detected, transcoding for compatibility")
         transcoded_path = file_path + ".transcoded.mp4"
         result = subprocess.run(
             [
                 FFMPEG_PATH, "-y", "-hide_banner", "-i", file_path,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-c:a", "copy",
+                "-c:a", "aac", "-b:a", "192k",
                 "-threads", "0",
                 "-movflags", "+faststart",
                 transcoded_path,
