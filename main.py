@@ -279,7 +279,7 @@ def normalize_url(url: str) -> str:
 
 AUTO_DELETE_SECONDS = int(os.environ.get("DOWNLOAD_EXPIRY_SECONDS", os.environ.get("AUTO_DELETE_SECONDS", "1500")))
 MAX_DOWNLOAD_SIZE_MB = int(os.environ.get("MAX_DOWNLOAD_SIZE_MB", "500"))
-DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "1"))
+DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "4"))
 METADATA_CACHE_SECONDS = int(os.environ.get("METADATA_CACHE_SECONDS", "300"))
 DISK_SAFETY_BUFFER_MB = int(os.environ.get("DISK_SAFETY_BUFFER_MB", "100"))
 DISK_SAFETY_BUFFER_BYTES = DISK_SAFETY_BUFFER_MB * 1024 * 1024
@@ -551,6 +551,8 @@ def ensure_disk_space(required_bytes: int, media_type: str = "video") -> bool:
 # anything yt-dlp wouldn't recognize as an actual video/media page.
 # ------------------------------------------------------------------
 _YDL_FOR_CHECK = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True})
+_allowed_url_cache = {}
+_allowed_url_lock = threading.Lock()
 
 
 def is_allowed_url(url: str) -> bool:
@@ -559,44 +561,83 @@ def is_allowed_url(url: str) -> bool:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             return False
+        netloc = parsed.netloc.lower()
     except Exception:
         return False
 
+    with _allowed_url_lock:
+        if netloc in _allowed_url_cache:
+            return _allowed_url_cache[netloc]
+
+    allowed = False
     try:
         for ie in _YDL_FOR_CHECK._ies.values():
             if ie.suitable(url) and ie.ie_key() not in ("Generic",):
-                return True
+                allowed = True
+                break
     except Exception as e:
         logger.error(f"Extractor check failed for {url}: {e}")
         return False
 
-    return False
+    with _allowed_url_lock:
+        _allowed_url_cache[netloc] = allowed
+
+    return allowed
 
 
 # ------------------------------------------------------------------
-# Task persistence (simple JSON file, fine for low volume / single worker)
+# Task persistence (in-memory cache with periodic / status-based JSON sync)
 # ------------------------------------------------------------------
+_tasks_cache = {}
+_tasks_cache_loaded = False
+_tasks_lock = threading.Lock()
+
+
 def load_tasks() -> dict:
-    if not os.path.exists(TASKS_FILE):
-        return {}
-    try:
-        with open(TASKS_FILE, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Failed to load tasks.json: {e}")
-        return {}
+    global _tasks_cache, _tasks_cache_loaded
+    with _tasks_lock:
+        if not _tasks_cache_loaded:
+            if os.path.exists(TASKS_FILE):
+                try:
+                    with open(TASKS_FILE, "r") as f:
+                        _tasks_cache = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to load tasks.json: {e}")
+                    _tasks_cache = {}
+            _tasks_cache_loaded = True
+        return dict(_tasks_cache)
 
 
-def save_task(task_id: str, data: dict):
-    tasks = load_tasks()
-    tasks[task_id] = data
-    try:
-        with open(TASKS_FILE, "w") as f:
-            json.dump(tasks, f)
-        logger.info(f"[{task_id}] status saved -> {data.get('status')} "
-                    f"progress={data.get('progress')}")
-    except Exception as e:
-        logger.error(f"[{task_id}] Failed to save tasks.json: {e}")
+def save_task(task_id: str, data: dict, force_disk: bool = False):
+    global _tasks_cache
+    with _tasks_lock:
+        if not _tasks_cache_loaded:
+            load_tasks()
+
+        prev = _tasks_cache.get(task_id, {})
+        _tasks_cache[task_id] = dict(data)
+
+        prev_status = prev.get("status")
+        curr_status = data.get("status")
+        prev_prog = prev.get("progress", 0)
+        curr_prog = data.get("progress", 0)
+
+        # Sync to disk on status changes, completed/failed, or >= 10% progress steps to reduce disk I/O
+        should_write = (
+            force_disk or
+            prev_status != curr_status or
+            abs(curr_prog - prev_prog) >= 10 or
+            curr_prog in (0, 100)
+        )
+
+        if should_write:
+            try:
+                with open(TASKS_FILE, "w") as f:
+                    json.dump(_tasks_cache, f)
+                logger.info(f"[{task_id}] status saved -> {data.get('status')} "
+                            f"progress={data.get('progress')}")
+            except Exception as e:
+                logger.error(f"[{task_id}] Failed to save tasks.json: {e}")
 
 
 class DownloadRequest(BaseModel):
@@ -871,8 +912,8 @@ def ensure_h264_playable(file_path: str, task_id: str) -> str:
         return file_path
     try:
         probe = subprocess.run(
-            [FFMPEG_PATH, "-i", file_path],
-            capture_output=True, text=True, timeout=30,
+            [FFMPEG_PATH, "-hide_banner", "-i", file_path],
+            capture_output=True, text=True, timeout=15,
         )
         info = probe.stderr
         if "h264" in info.lower():
@@ -882,13 +923,14 @@ def ensure_h264_playable(file_path: str, task_id: str) -> str:
         transcoded_path = file_path + ".transcoded.mp4"
         result = subprocess.run(
             [
-                FFMPEG_PATH, "-y", "-i", file_path,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
+                FFMPEG_PATH, "-y", "-hide_banner", "-i", file_path,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "copy",
+                "-threads", "0",
                 "-movflags", "+faststart",
                 transcoded_path,
             ],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0 and os.path.exists(transcoded_path):
             os.replace(transcoded_path, file_path)
@@ -948,6 +990,9 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                 "yt-dlp",
                 "--no-playlist",
                 "--newline",
+                "-N", "8",
+                "--buffer-size", "64k",
+                "--http-chunk-size", "10M",
                 "-o", file_path,
                 "--max-filesize", "500M",
                 "--js-runtimes", "deno,node",
@@ -979,12 +1024,12 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                     try:
                         height = int(quality[:-1])
                         c += [
-                            "-f", f"bv*[height<={height}][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<={height}]+ba/b",
+                            "-f", f"bv*[height<={height}][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<={height}][vcodec^=h264]+ba/bv*[height<={height}]+ba/b",
                         ]
                     except ValueError:
-                        c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b"]
+                        c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=h264]+ba/bv*+ba/b"]
                 else:
-                    c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b"]
+                    c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=h264]+ba/bv*+ba/b"]
                 c += ["-S", "ext:mp4:m4a"]
 
             c.append(url)
@@ -1012,7 +1057,7 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
     # find a combo that works better for your traffic and don't want to
     # redeploy code to change it.
     # ------------------------------------------------------------------
-    default_strategies = [None, "default", "tv_simply,web", "android,web", "web_safari,tv"]
+    default_strategies = [None, "android,web", "tv_simply,web", "web_safari,tv"]
     env_override = os.environ.get("YOUTUBE_PLAYER_CLIENT")
     if env_override:
         client_strategies = [s if s else None for s in env_override.split(";")]
