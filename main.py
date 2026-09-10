@@ -899,7 +899,8 @@ def parse_progress_line(line: str):
     match = re.search(r"\[download\]\s+(\d{1,3}\.\d)%", line)
     if match:
         try:
-            return int(float(match.group(1)))
+            val = int(float(match.group(1)))
+            return min(val, 99)  # Keep in-progress progress capped at 99% until status="completed"
         except ValueError:
             return None
     return None
@@ -925,8 +926,8 @@ def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
             [FFMPEG_PATH, "-hide_banner", "-i", file_path],
             capture_output=True, text=True, timeout=15,
         )
-        info = probe.stderr
-        if "h264" in info.lower():
+        info_lower = probe.stderr.lower()
+        if "h264" in info_lower or "h.264" in info_lower or "avc" in info_lower or "mp4v" in info_lower or "mpeg4" in info_lower:
             return file_path, 0.0
 
         logger.info(f"[{task_id}] Non-H.264 video detected, transcoding for compatibility")
@@ -1291,7 +1292,7 @@ def get_task_metrics(task_id: str):
         except Exception:
             pass
 
-    size_formatted = task.get("file_size_formatted") or format_bytes(file_size_bytes)
+    size_formatted = format_bytes(file_size_bytes) if file_size_bytes > 0 else (task.get("file_size_formatted") or "0 B")
 
     return {
         "task_id": task_id,
