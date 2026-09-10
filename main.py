@@ -615,12 +615,14 @@ def save_task(task_id: str, data: dict, force_disk: bool = False):
             load_tasks()
 
         prev = _tasks_cache.get(task_id, {})
-        _tasks_cache[task_id] = dict(data)
+        updated = dict(prev)
+        updated.update(data)
+        _tasks_cache[task_id] = updated
 
         prev_status = prev.get("status")
-        curr_status = data.get("status")
+        curr_status = updated.get("status")
         prev_prog = prev.get("progress", 0)
-        curr_prog = data.get("progress", 0)
+        curr_prog = updated.get("progress", 0)
 
         # Sync to disk on status changes, completed/failed, or >= 10% progress steps to reduce disk I/O
         should_write = (
@@ -634,8 +636,8 @@ def save_task(task_id: str, data: dict, force_disk: bool = False):
             try:
                 with open(TASKS_FILE, "w") as f:
                     json.dump(_tasks_cache, f)
-                logger.info(f"[{task_id}] status saved -> {data.get('status')} "
-                            f"progress={data.get('progress')}")
+                logger.info(f"[{task_id}] status saved -> {updated.get('status')} "
+                            f"progress={updated.get('progress')}")
             except Exception as e:
                 logger.error(f"[{task_id}] Failed to save tasks.json: {e}")
 
@@ -930,6 +932,13 @@ def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
         if "h264" in info_lower or "h.264" in info_lower or "avc" in info_lower or "mp4v" in info_lower or "mpeg4" in info_lower:
             return file_path, 0.0
 
+        # For large high-res files (>50 MB), serving the downloaded MP4 directly
+        # avoids 50s CPU transcoding bottlenecks while preserving immediate delivery.
+        size_bytes = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        if size_bytes > 50 * 1024 * 1024:
+            logger.info(f"[{task_id}] Large video file ({size_bytes} bytes), serving directly without CPU transcode for speed")
+            return file_path, 0.0
+
         logger.info(f"[{task_id}] Non-H.264 video detected, transcoding for compatibility")
         transcoded_path = file_path + ".transcoded.mp4"
         result = subprocess.run(
@@ -949,7 +958,6 @@ def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
             logger.info(f"[{task_id}] Transcoded to H.264 successfully in {transcode_duration}s")
             return file_path, transcode_duration
         else:
-            logger.warning(f"[{task_id}] Transcode failed, serving original file: {result.stderr[-500:]}")
             if os.path.exists(transcoded_path):
                 os.remove(transcoded_path)
             return file_path, transcode_duration
@@ -1046,7 +1054,7 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                         c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=h264]+ba/bv*+ba/b"]
                 else:
                     c += ["-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=h264]+ba/bv*+ba/b"]
-                c += ["-S", "ext:mp4:m4a"]
+                c += ["-S", "vcodec:h264,res,ext:mp4:m4a"]
 
             c.append(url)
             return c
