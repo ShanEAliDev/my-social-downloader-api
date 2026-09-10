@@ -17,6 +17,9 @@ import threading
 import asyncio
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import yt_dlp
 import imageio_ffmpeg
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, Depends
@@ -337,11 +340,27 @@ def fetch_metadata(url: str) -> dict:
         "skip_download": True,
         "no_playlist": True,
     }
+    cookie_path = cookie_file_for_url(url)
+    if cookie_path:
+        ydl_opts["cookiefile"] = cookie_path
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
     if not info:
         raise ValueError("Could not extract metadata")
+
+    # Instagram Stories (and some other multi-item URLs) return a
+    # playlist wrapper with the real format/duration/thumbnail data
+    # nested inside entries[0], not at the top level. Unwrap the first
+    # entry so downstream code (build_quality_options etc.) sees a
+    # normal flat video dict.
+    if info.get("_type") == "playlist":
+        entries = info.get("entries") or []
+        if entries and entries[0]:
+            first = dict(entries[0])
+            first["_playlist_title"] = info.get("title")
+            first["_playlist_id"] = info.get("id")
+            info = first
 
     return info
 
@@ -836,6 +855,54 @@ def parse_progress_line(line: str):
     return None
 
 
+def ensure_h264_playable(file_path: str, task_id: str) -> str:
+    """
+    Some sources (notably Instagram Stories/Reels) only expose VP9/AV1
+    video with no H.264 alternative. ffmpeg's MP4 muxer will silently
+    accept VP9 in an .mp4 container without complaint, but many real
+    players (WhatsApp, various Android/iOS apps) reject it outright -
+    this is what caused "couldn't process video" on WhatsApp even
+    though the file plays fine in VLC/ffprobe. Only re-encode when the
+    codec genuinely isn't H.264, so normal YouTube/TikTok/Facebook
+    downloads (already H.264 in the vast majority of cases) pay no
+    extra cost.
+    """
+    if not FFMPEG_PATH:
+        return file_path
+    try:
+        probe = subprocess.run(
+            [FFMPEG_PATH, "-i", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = probe.stderr
+        if "h264" in info.lower():
+            return file_path
+
+        logger.info(f"[{task_id}] Non-H.264 video detected, transcoding for compatibility")
+        transcoded_path = file_path + ".transcoded.mp4"
+        result = subprocess.run(
+            [
+                FFMPEG_PATH, "-y", "-i", file_path,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                transcoded_path,
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode == 0 and os.path.exists(transcoded_path):
+            os.replace(transcoded_path, file_path)
+            logger.info(f"[{task_id}] Transcoded to H.264 successfully")
+        else:
+            logger.warning(f"[{task_id}] Transcode failed, serving original file: {result.stderr[-500:]}")
+            if os.path.exists(transcoded_path):
+                os.remove(transcoded_path)
+    except Exception as e:
+        logger.warning(f"[{task_id}] ensure_h264_playable check failed: {e}")
+
+    return file_path
+
+
 def cleanup_task_fragments(task_id: str, keep_path: str = None):
     """
     Remove any leftover per-stream fragment files for this task
@@ -1068,6 +1135,8 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
         # of silently serving a broken file.
         # ------------------------------------------------------------
         if os.path.exists(file_path):
+            if media_type == "video":
+                file_path = ensure_h264_playable(file_path, task_id)
             size = os.path.getsize(file_path)
             logger.info(f"[{task_id}] File confirmed on disk: {file_path} ({size} bytes)")
             _persist(status="completed", progress=100, url=url, file_path=file_path, download_url=f"/download-file/{task_id}")
