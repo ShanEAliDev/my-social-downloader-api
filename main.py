@@ -983,6 +983,7 @@ def cleanup_task_fragments(task_id: str, keep_path: str = None):
 
 def download_task(url: str, task_id: str, file_path: str, media_type: str = "video", quality: str = None):
     logger.info(f"[{task_id}] download_task() started media_type={media_type} quality={quality}")
+    download_start_time = time.time()
 
     existing = load_tasks().get(task_id, {})
     existing.update({
