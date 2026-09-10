@@ -1294,6 +1294,11 @@ def get_task_metrics(task_id: str):
 
     size_formatted = format_bytes(file_size_bytes) if file_size_bytes > 0 else (task.get("file_size_formatted") or "0 B")
 
+    created_at = task.get("created_at") or time.time()
+    completed_at = task.get("completed_at")
+    now_t = completed_at if completed_at else time.time()
+    elapsed_so_far = round(now_t - created_at, 3)
+
     return {
         "task_id": task_id,
         "status": task.get("status"),
@@ -1301,13 +1306,14 @@ def get_task_metrics(task_id: str):
         "url": task.get("url"),
         "media_type": task.get("media_type"),
         "quality": task.get("quality"),
-        "created_at": task.get("created_at"),
-        "completed_at": task.get("completed_at"),
+        "created_at": created_at,
+        "completed_at": completed_at,
         "timing": {
             "metadata_fetch_seconds": task.get("metadata_fetch_seconds", 0.0),
             "download_execution_seconds": task.get("download_execution_seconds", 0.0),
             "transcode_seconds": task.get("transcode_seconds", 0.0),
-            "total_backend_seconds": task.get("total_backend_seconds", 0.0),
+            "total_backend_seconds": task.get("total_backend_seconds", 0.0) or elapsed_so_far,
+            "elapsed_so_far_seconds": elapsed_so_far,
         },
         "file_info": {
             "file_path": file_path,
