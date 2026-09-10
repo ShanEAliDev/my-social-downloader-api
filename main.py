@@ -318,16 +318,16 @@ def get_cached_metadata(url: str):
     with _metadata_cache_lock:
         entry = _metadata_cache.get(url)
         if entry:
-            ts, info = entry
+            ts, info, fetch_duration = entry
             if time.time() - ts < METADATA_CACHE_SECONDS:
-                return info
+                return info, fetch_duration
             del _metadata_cache[url]
-    return None
+    return None, None
 
 
-def set_cached_metadata(url: str, info: dict):
+def set_cached_metadata(url: str, info: dict, fetch_duration: float = 0.0):
     with _metadata_cache_lock:
-        _metadata_cache[url] = (time.time(), info)
+        _metadata_cache[url] = (time.time(), info, fetch_duration)
 
 
 # ------------------------------------------------------------------
@@ -677,16 +677,16 @@ async def get_metadata(request: Request, body: MetadataRequest):
     if not is_allowed_url(body.url):
         raise HTTPException(status_code=400, detail="URL host is not supported")
 
-    cached = get_cached_metadata(body.url)
-    if cached:
-        info = cached
-    else:
+    start_t = time.time()
+    info, fetch_duration = get_cached_metadata(body.url)
+    if not info:
         try:
             info = fetch_metadata(body.url)
+            fetch_duration = round(time.time() - start_t, 3)
         except Exception as e:
             logger.error(f"Metadata fetch failed for {body.url}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {e}")
-        set_cached_metadata(body.url, info)
+        set_cached_metadata(body.url, info, fetch_duration)
 
     thumbnail = ""
     if info.get("thumbnail"):
@@ -812,25 +812,34 @@ async def start_download(request: Request, body: DownloadRequest, background_tas
     created_at = time.time()
     auto_delete_seconds = random.randint(1200, 1800)
 
+    start_meta_t = time.time()
+    info, meta_duration = get_cached_metadata(body.url)
+    if not info:
+        try:
+            info = fetch_metadata(body.url)
+            meta_duration = round(time.time() - start_meta_t, 3)
+            set_cached_metadata(body.url, info, meta_duration)
+        except Exception as e:
+            _release_download_slot()
+            logger.warning(f"[{task_id}] Metadata fetch failed: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {e}")
+
     save_task(task_id, {
         "status": "started",
         "progress": 0,
         "url": body.url,
         "file_path": file_path,
         "media_type": body.media_type,
+        "quality": body.quality,
         "created_at": created_at,
         "auto_delete_seconds": auto_delete_seconds,
+        "metadata_fetch_seconds": meta_duration or 0.0,
+        "download_execution_seconds": 0.0,
+        "transcode_seconds": 0.0,
+        "total_backend_seconds": 0.0,
+        "file_size_bytes": 0,
+        "file_size_formatted": "0 B",
     })
-
-    info = get_cached_metadata(body.url)
-    if not info:
-        try:
-            info = fetch_metadata(body.url)
-            set_cached_metadata(body.url, info)
-        except Exception as e:
-            _release_download_slot()
-            logger.warning(f"[{task_id}] Metadata fetch failed: {e}")
-            raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {e}")
 
     fmt = None
     raw_qualities = build_quality_options(info)
@@ -896,7 +905,7 @@ def parse_progress_line(line: str):
     return None
 
 
-def ensure_h264_playable(file_path: str, task_id: str) -> str:
+def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
     """
     Some sources (notably Instagram Stories/Reels) only expose VP9/AV1
     video with no H.264 alternative. ffmpeg's MP4 muxer will silently
@@ -909,7 +918,8 @@ def ensure_h264_playable(file_path: str, task_id: str) -> str:
     extra cost.
     """
     if not FFMPEG_PATH:
-        return file_path
+        return file_path, 0.0
+    start_t = time.time()
     try:
         probe = subprocess.run(
             [FFMPEG_PATH, "-hide_banner", "-i", file_path],
@@ -917,7 +927,7 @@ def ensure_h264_playable(file_path: str, task_id: str) -> str:
         )
         info = probe.stderr
         if "h264" in info.lower():
-            return file_path
+            return file_path, 0.0
 
         logger.info(f"[{task_id}] Non-H.264 video detected, transcoding for compatibility")
         transcoded_path = file_path + ".transcoded.mp4"
@@ -932,17 +942,21 @@ def ensure_h264_playable(file_path: str, task_id: str) -> str:
             ],
             capture_output=True, text=True, timeout=120,
         )
+        transcode_duration = round(time.time() - start_t, 3)
         if result.returncode == 0 and os.path.exists(transcoded_path):
             os.replace(transcoded_path, file_path)
-            logger.info(f"[{task_id}] Transcoded to H.264 successfully")
+            logger.info(f"[{task_id}] Transcoded to H.264 successfully in {transcode_duration}s")
+            return file_path, transcode_duration
         else:
             logger.warning(f"[{task_id}] Transcode failed, serving original file: {result.stderr[-500:]}")
             if os.path.exists(transcoded_path):
                 os.remove(transcoded_path)
+            return file_path, transcode_duration
     except Exception as e:
         logger.warning(f"[{task_id}] ensure_h264_playable check failed: {e}")
+        return file_path, 0.0
 
-    return file_path
+    return file_path, 0.0
 
 
 def cleanup_task_fragments(task_id: str, keep_path: str = None):
@@ -1180,11 +1194,34 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
         # of silently serving a broken file.
         # ------------------------------------------------------------
         if os.path.exists(file_path):
+            transcode_duration = 0.0
             if media_type == "video":
-                file_path = ensure_h264_playable(file_path, task_id)
-            size = os.path.getsize(file_path)
-            logger.info(f"[{task_id}] File confirmed on disk: {file_path} ({size} bytes)")
-            _persist(status="completed", progress=100, url=url, file_path=file_path, download_url=f"/download-file/{task_id}")
+                file_path, transcode_duration = ensure_h264_playable(file_path, task_id)
+            size_bytes = os.path.getsize(file_path)
+            size_formatted = format_bytes(size_bytes)
+            completed_at = time.time()
+            created_at = existing.get("created_at", time.time())
+
+            download_exec_seconds = round(completed_at - download_start_time - transcode_duration, 3)
+            total_backend_seconds = round(completed_at - created_at, 3)
+
+            logger.info(f"[{task_id}] File confirmed on disk: {file_path} ({size_bytes} bytes). "
+                        f"Download time: {download_exec_seconds}s, Transcode time: {transcode_duration}s, "
+                        f"Total time: {total_backend_seconds}s")
+
+            _persist(
+                status="completed",
+                progress=100,
+                url=url,
+                file_path=file_path,
+                download_url=f"/download-file/{task_id}",
+                completed_at=completed_at,
+                download_execution_seconds=download_exec_seconds,
+                transcode_seconds=transcode_duration,
+                total_backend_seconds=total_backend_seconds,
+                file_size_bytes=size_bytes,
+                file_size_formatted=size_formatted,
+            )
             cleanup_task_fragments(task_id, keep_path=file_path)
         else:
             leftover = glob.glob(os.path.join(BASE_DIR, f"{task_id}.*"))
@@ -1227,6 +1264,57 @@ def get_status(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+@app.get("/task-metrics/{task_id}", dependencies=[Depends(require_api_key)])
+def get_task_metrics(task_id: str):
+    """
+    Detailed timing and file size metrics for a download task:
+    - metadata_fetch_seconds: Time taken to fetch URL info and variations
+    - download_execution_seconds: Time taken to download stream fragments
+    - transcode_seconds: Time taken for H.264 re-encoding (if run)
+    - total_backend_seconds: Total time elapsed from task request to completion
+    - file size in bytes and formatted (e.g. '22.9 MB')
+    """
+    tasks = load_tasks()
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    file_path = task.get("file_path")
+    file_exists = bool(file_path and os.path.exists(file_path))
+    file_size_bytes = task.get("file_size_bytes", 0)
+    if file_exists and file_size_bytes == 0:
+        try:
+            file_size_bytes = os.path.getsize(file_path)
+        except Exception:
+            pass
+
+    size_formatted = task.get("file_size_formatted") or format_bytes(file_size_bytes)
+
+    return {
+        "task_id": task_id,
+        "status": task.get("status"),
+        "progress": task.get("progress", 0),
+        "url": task.get("url"),
+        "media_type": task.get("media_type"),
+        "quality": task.get("quality"),
+        "created_at": task.get("created_at"),
+        "completed_at": task.get("completed_at"),
+        "timing": {
+            "metadata_fetch_seconds": task.get("metadata_fetch_seconds", 0.0),
+            "download_execution_seconds": task.get("download_execution_seconds", 0.0),
+            "transcode_seconds": task.get("transcode_seconds", 0.0),
+            "total_backend_seconds": task.get("total_backend_seconds", 0.0),
+        },
+        "file_info": {
+            "file_path": file_path,
+            "size_bytes": file_size_bytes,
+            "size_formatted": size_formatted,
+            "available": file_exists,
+        },
+        "error": task.get("error"),
+    }
 
 
 @app.get("/file-status/{task_id}", dependencies=[Depends(require_api_key)])
