@@ -714,6 +714,25 @@ def home():
     return {"message": "API Working"}
 
 
+@app.get("/health/deep")
+async def deep_health_check():
+    """
+    Actually exercises the extraction pipeline against a known-stable
+    test URL, rather than just confirming the process is alive. Meant
+    to be hit by an external uptime monitor on a schedule (e.g. every
+    15-30 min) so real breakage (not just crashes) gets caught fast.
+    """
+    test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    try:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, fetch_metadata, test_url)
+        ok = bool(info and info.get("title"))
+        return {"healthy": ok, "checked_url": test_url, "title": info.get("title") if ok else None}
+    except Exception as e:
+        return {"healthy": False, "error": str(e), "checked_url": test_url}
+
+
+
 @app.post("/get-metadata", dependencies=[Depends(require_api_key)])
 @limiter.limit("10/minute")
 async def get_metadata(request: Request, body: MetadataRequest):
