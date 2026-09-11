@@ -75,6 +75,31 @@ def require_api_key(x_api_key: str = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def classify_error(error_text: str) -> str:
+    t = (error_text or "").lower()
+    if "no video formats found" in t or "no video" in t:
+        return "NO_VIDEO_IN_POST"
+    if "login required" in t or "private" in t or ("age" in t and "restrict" in t):
+        return "PRIVATE_OR_LOGIN_REQUIRED"
+    if "content unavailable" in t or "this video is not available" in t or "has been removed" in t:
+        return "CONTENT_DELETED"
+    if "url host is not supported" in t:
+        return "UNSUPPORTED_HOST"
+    if "unable to estimate download size" in t:
+        return "SIZE_ESTIMATE_FAILED"
+    if "rate limit" in t or "429" in t:
+        return "RATE_LIMITED"
+    if "server storage is temporarily full" in t:
+        return "SERVER_STORAGE_FULL"
+    if "expired or lost on redeploy" in t or "file not ready" in t:
+        return "TASK_EXPIRED"
+    if "cookies" in t or "authentication" in t:
+        return "UPSTREAM_BLOCKED"
+    return "EXTRACTOR_FAILED"
+
+
+
+
 # ------------------------------------------------------------------
 # Storage locations
 # ------------------------------------------------------------------
@@ -341,10 +366,23 @@ def fetch_metadata(url: str) -> dict:
         "no_playlist": True,
     }
     cookie_path = cookie_file_for_url(url)
+    info = None
+
     if cookie_path:
-        ydl_opts["cookiefile"] = cookie_path
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        opts_with_cookies = dict(ydl_opts)
+        opts_with_cookies["cookiefile"] = cookie_path
+        try:
+            with yt_dlp.YoutubeDL(opts_with_cookies) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            logger.warning(
+                f"Metadata fetch with cookies ({cookie_path}) failed for {url}: {e}. "
+                "Retrying without cookies..."
+            )
+
+    if not info:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
     if not info:
         raise ValueError("Could not extract metadata")
@@ -828,24 +866,10 @@ async def start_download(request: Request, body: DownloadRequest, background_tas
         except Exception as e:
             _release_download_slot()
             logger.warning(f"[{task_id}] Metadata fetch failed: {e}")
-            raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {e}")
-
-    save_task(task_id, {
-        "status": "started",
-        "progress": 0,
-        "url": body.url,
-        "file_path": file_path,
-        "media_type": body.media_type,
-        "quality": body.quality,
-        "created_at": created_at,
-        "auto_delete_seconds": auto_delete_seconds,
-        "metadata_fetch_seconds": meta_duration or 0.0,
-        "download_execution_seconds": 0.0,
-        "transcode_seconds": 0.0,
-        "total_backend_seconds": 0.0,
-        "file_size_bytes": 0,
-        "file_size_formatted": "0 B",
-    })
+            raise HTTPException(
+                status_code=400,
+                detail={"detail": f"Failed to fetch metadata: {e}", "error_code": classify_error(str(e))},
+            )
 
     fmt = None
     raw_qualities = build_quality_options(info)
@@ -877,7 +901,34 @@ async def start_download(request: Request, body: DownloadRequest, background_tas
 
     if required_bytes <= 0:
         _release_download_slot()
-        raise HTTPException(status_code=400, detail="Unable to estimate download size")
+        err_msg = "Unable to estimate download size"
+        raise HTTPException(
+            status_code=400,
+            detail={"detail": err_msg, "error_code": classify_error(err_msg)},
+        )
+
+    save_task(task_id, {
+        "status": "started",
+        "phase": "queued",
+        "progress": 0,
+        "url": body.url,
+        "file_path": file_path,
+        "media_type": body.media_type,
+        "quality": body.quality,
+        "created_at": created_at,
+        "auto_delete_seconds": auto_delete_seconds,
+        "metadata_fetch_seconds": meta_duration or 0.0,
+        "download_execution_seconds": 0.0,
+        "transcode_seconds": 0.0,
+        "total_backend_seconds": 0.0,
+        "file_size_bytes": 0,
+        "file_size_formatted": "0 B",
+        "downloaded_bytes": 0,
+        "total_bytes": required_bytes,
+        "total_bytes_is_estimate": (fmt.get("filesize") is None) if fmt else True,
+        "speed_bps": 0,
+        "eta_seconds": -1,
+    })
 
     media_type = body.media_type
     if media_type == "audio":
@@ -892,24 +943,93 @@ async def start_download(request: Request, body: DownloadRequest, background_tas
         time.sleep(1)
     else:
         _release_download_slot()
+        err_msg = "Server storage is temporarily full. Please try again later."
+        _persist_err = load_tasks().get(task_id, {})
+        _persist_err.update({"status": "failed", "phase": "failed", "error": err_msg, "error_code": classify_error(err_msg)})
+        save_task(task_id, _persist_err)
         raise HTTPException(
             status_code=507,
-            detail="Server storage is temporarily full. Please try again later."
+            detail={"detail": err_msg, "error_code": classify_error(err_msg)},
         )
 
     background_tasks.add_task(download_task, body.url, task_id, file_path, media_type, body.quality)
     return {"task_id": task_id, "status": "started", "message": "Download started"}
 
 
-def parse_progress_line(line: str):
-    match = re.search(r"\[download\]\s+(\d{1,3}\.\d)%", line)
-    if match:
-        try:
-            val = int(float(match.group(1)))
-            return min(val, 99)  # Keep in-progress progress capped at 99% until status="completed"
-        except ValueError:
-            return None
+_PROGRESS_RE = re.compile(
+    r"\[download\]\s+(?P<pct>\d{1,3}\.\d)%"
+    r"(?:\s+of\s+(?:~\s*)?(?P<total>[\d.]+)(?P<total_unit>\w+))?"
+    r"(?:\s+at\s+(?P<speed>[\d.]+)(?P<speed_unit>\w+)/s)?"
+    r"(?:\s+ETA\s+(?P<eta>[\d:]+))?"
+)
+
+_FRAGMENT_RE = re.compile(
+    r"\[download\]\s+Downloading fragment\s+(?P<idx>\d+)\s+of\s+(?P<count>\d+)"
+)
+
+_UNIT_MULTIPLIERS = {
+    "B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3,
+    "KB": 1000, "MB": 1000**2, "GB": 1000**3,
+}
+
+
+def _parse_size(value: str, unit: str) -> int:
+    mult = _UNIT_MULTIPLIERS.get(unit, 1)
+    return int(float(value) * mult)
+
+
+def _parse_eta(eta_str: str) -> int:
+    parts = [int(p) for p in eta_str.split(":")]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return -1
+
+
+def parse_progress_data(line: str, known_total_bytes: int = 0) -> dict | None:
+    """
+    Returns a dict of whatever fields could be parsed from this line,
+    or None if the line isn't a progress line at all. Caller merges
+    whatever keys are present into the task record - never overwrite
+    with a missing/None value.
+    """
+    m = _PROGRESS_RE.search(line)
+    if m:
+        result = {}
+        pct = min(int(float(m.group("pct"))), 99)
+        result["progress"] = pct
+
+        total_bytes = known_total_bytes
+        if m.group("total"):
+            total_bytes = _parse_size(m.group("total"), m.group("total_unit"))
+            result["total_bytes"] = total_bytes
+            result["total_bytes_is_estimate"] = False
+
+        if total_bytes:
+            result["downloaded_bytes"] = int(total_bytes * pct / 100)
+
+        if m.group("speed"):
+            result["speed_bps"] = _parse_size(m.group("speed"), m.group("speed_unit"))
+
+        if m.group("eta"):
+            result["eta_seconds"] = _parse_eta(m.group("eta"))
+
+        result["phase"] = "fetching"
+        return result
+
+    m = _FRAGMENT_RE.search(line)
+    if m:
+        idx, count = int(m.group("idx")), int(m.group("count"))
+        if count > 0:
+            return {
+                "progress": min(int(100 * idx / count), 99),
+                "total_bytes": 0,
+                "phase": "fetching",
+            }
+
     return None
+
 
 
 def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
@@ -937,6 +1057,7 @@ def ensure_h264_playable(file_path: str, task_id: str) -> tuple[str, float]:
             return file_path, 0.0
 
         logger.info(f"[{task_id}] Non-H.264 video detected, transcoding for compatibility")
+        save_task(task_id, {"phase": "transcoding"})
         transcoded_path = file_path + ".transcoded.mp4"
         result = subprocess.run(
             [
@@ -992,9 +1113,11 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
     download_start_time = time.time()
 
     existing = load_tasks().get(task_id, {})
+    known_total_bytes = existing.get("total_bytes", 0)
     existing.update({
         "status": "downloading",
-        "progress": 0,
+        "phase": "fetching",
+        "progress": existing.get("progress", 0),
         "url": url,
         "file_path": file_path,
         "media_type": media_type,
@@ -1006,7 +1129,7 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
         current.update(updates)
         save_task(task_id, current)
 
-    def build_cmd(player_client: str = None) -> list:
+    def build_cmd(player_client: str = None, use_cookies: bool = True) -> list:
             c = [
                 "yt-dlp",
                 "--no-playlist",
@@ -1023,9 +1146,10 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                 c += ["--ffmpeg-location", FFMPEG_PATH]
             if player_client:
                 c += ["--extractor-args", f"youtube:player_client={player_client}"]
-            cookie_path = cookie_file_for_url(url)
-            if cookie_path:
-                c += ["--cookies", cookie_path]
+            if use_cookies:
+                cookie_path = cookie_file_for_url(url)
+                if cookie_path:
+                    c += ["--cookies", cookie_path]
 
             if media_type == "audio":
                 c += [
@@ -1058,25 +1182,6 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
 
     # ------------------------------------------------------------------
     # YouTube client-strategy list.
-    #
-    # CONTEXT: YouTube periodically forces "SABR-only" streaming for
-    # specific player clients, causing yt-dlp to receive a format list
-    # where every entry is unusable ("Requested format is not available"
-    # even though the video plays fine in a browser). WHICH client(s) are
-    # currently broken shifts every few weeks as YouTube and yt-dlp go
-    # back and forth - see https://github.com/yt-dlp/yt-dlp/issues/12482.
-    #
-    # There is no single client combo that stays correct for more than a
-    # few weeks at a time, so instead of picking one, we try several in
-    # order and only give up if all of them fail. Whichever one currently
-    # works differs by IP/region/YouTube A/B test, which is exactly why a
-    # multi-strategy approach is more robust than hardcoding a "best" pick.
-    #
-    # Override entirely via YOUTUBE_PLAYER_CLIENT env var (comma-separated
-    # strategies, each itself comma-separated client names, semicolon
-    # between strategies) e.g. "android,web;tv_simply,web_safari" if you
-    # find a combo that works better for your traffic and don't want to
-    # redeploy code to change it.
     # ------------------------------------------------------------------
     default_strategies = [None, "android,web", "tv_simply,web", "web_safari,tv"]
     env_override = os.environ.get("YOUTUBE_PLAYER_CLIENT")
@@ -1086,21 +1191,30 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
         client_strategies = default_strategies
 
     is_youtube = "youtube.com" in url or "youtu.be" in url
-    strategies_to_try = client_strategies if is_youtube else [None]
+    has_cookies = bool(cookie_file_for_url(url))
 
-    cookie_path = cookie_file_for_url(url)
-    if cookie_path:
-        logger.info(f"[{task_id}] Using cookies file: {cookie_path}")
+    if is_youtube:
+        strategies_to_try = [(s, True) for s in client_strategies]
+    else:
+        if has_cookies:
+            strategies_to_try = [(None, True), (None, False)]  # try with cookies, then fallback without
+        else:
+            strategies_to_try = [(None, False)]
+
+    if has_cookies:
+        logger.info(f"[{task_id}] Cookie file available for this URL. Will attempt with cookies first.")
     else:
         logger.info(f"[{task_id}] No cookie file for this URL, downloading unauthenticated")
 
     last_progress = 0
+    last_known_total = known_total_bytes
+    last_write_time = 0.0
     all_attempts_output = []  # every strategy's tail, so a final failure is fully explained
     TAIL_MAX = 20
 
     def run_attempt(cmd: list):
         """Runs one yt-dlp attempt. Returns (returncode, output_tail)."""
-        nonlocal last_progress
+        nonlocal last_progress, last_known_total, last_write_time
         output_tail = []
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -1113,10 +1227,22 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
             output_tail.append(line)
             if len(output_tail) > TAIL_MAX:
                 output_tail.pop(0)
-            pct = parse_progress_line(line)
-            if pct is not None and pct != last_progress:
-                last_progress = pct
-                _persist(status="downloading", progress=pct, url=url, file_path=file_path)
+
+            parsed = parse_progress_data(line, known_total_bytes=last_known_total)
+            if parsed:
+                if "total_bytes" in parsed and parsed["total_bytes"]:
+                    last_known_total = parsed["total_bytes"]
+                now = time.time()
+                pct = parsed.get("progress")
+                pct_changed = (pct is not None and pct != last_progress)
+                time_passed = (now - last_write_time >= 0.4)
+
+                if pct_changed or time_passed:
+                    if pct is not None:
+                        last_progress = pct
+                    last_write_time = now
+                    _persist(status="downloading", **parsed)
+
         returncode = process.wait(timeout=300)
         return returncode, output_tail
 
@@ -1125,24 +1251,27 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
         "Only images are available for download",
         "forcing SABR streaming",
         "PO Token",
+        "HTTP Error 400",
+        "Bad Request",
+        "HTTPError 400",
     )
 
     try:
         final_returncode = None
         final_tail = []
 
-        for attempt_num, strategy in enumerate(strategies_to_try, start=1):
-            cmd = build_cmd(strategy)
+        for attempt_num, (strategy, use_cookies) in enumerate(strategies_to_try, start=1):
+            cmd = build_cmd(strategy, use_cookies=use_cookies)
             logger.info(
                 f"[{task_id}] Attempt {attempt_num}/{len(strategies_to_try)} "
-                f"(player_client={strategy or 'yt-dlp default'})"
+                f"(player_client={strategy or 'yt-dlp default'}, use_cookies={use_cookies})"
             )
-            _persist(status="downloading", progress=last_progress, url=url, file_path=file_path)
+            _persist(status="downloading", phase="fetching", progress=last_progress, url=url, file_path=file_path)
 
             returncode, output_tail = run_attempt(cmd)
             final_returncode, final_tail = returncode, output_tail
             all_attempts_output.append(
-                f"--- attempt {attempt_num} (player_client={strategy or 'default'}) ---\n"
+                f"--- attempt {attempt_num} (player_client={strategy or 'default'}, use_cookies={use_cookies}) ---\n"
                 + "\n".join(output_tail)
             )
 
@@ -1160,13 +1289,6 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
         logger.info(f"[{task_id}] yt-dlp exited with code {returncode} after {len(all_attempts_output)} attempt(s)")
 
         if returncode != 0:
-            # BUGFIX: this used to only look at lines containing "ERROR",
-            # but the actually-useful diagnostic for SABR/PO-token
-            # failures is logged by yt-dlp as a WARNING ("YouTube is
-            # forcing SABR streaming for this client..."), so it was
-            # silently invisible in the saved error before. Now we surface
-            # WARNING lines too, plus which client strategies were
-            # attempted, so the failure message is fully self-explanatory.
             tail = final_tail
             important_lines = [
                 l for l in tail
@@ -1181,28 +1303,22 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                 f"Last error: {detail or f'yt-dlp exited with code {returncode}, no output captured'}"
             )
 
-            _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=error_msg)
+            _persist(
+                status="failed",
+                phase="failed",
+                progress=last_progress,
+                url=url,
+                file_path=file_path,
+                error=error_msg,
+                error_code=classify_error(error_msg),
+            )
             cleanup_task_fragments(task_id)
             return
 
-        # ------------------------------------------------------------
-        # IMPORTANT: only trust the EXACT expected output path here.
-        #
-        # Previously, if the exact file was missing, the code fell back
-        # to `glob.glob(f"{task_id}.*")` and just grabbed the first
-        # match - which, when the video+audio merge fails (e.g. ffmpeg
-        # missing), returns one of the *unmerged single-stream fragment
-        # files* (like "<task_id>.fdash-....v.mp4", video only). That
-        # file would then get reported as "completed" and served to
-        # users, which is exactly the no-audio bug that was reported.
-        #
-        # Now: if the exact merged file isn't there, we treat this as a
-        # genuine failure and surface a clear, actionable error instead
-        # of silently serving a broken file.
-        # ------------------------------------------------------------
         if os.path.exists(file_path):
             transcode_duration = 0.0
             if media_type == "video":
+                _persist(phase="merging")
                 file_path, transcode_duration = ensure_h264_playable(file_path, task_id)
             size_bytes = os.path.getsize(file_path)
             size_formatted = format_bytes(size_bytes)
@@ -1218,7 +1334,11 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
 
             _persist(
                 status="completed",
+                phase="completed",
                 progress=100,
+                downloaded_bytes=size_bytes,
+                speed_bps=0,
+                eta_seconds=0,
                 url=url,
                 file_path=file_path,
                 download_url=f"/download-file/{task_id}",
@@ -1235,9 +1355,6 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
             leftover = [m for m in leftover if not m.endswith(".json")]
 
             if leftover:
-                # yt-dlp exited 0 but never produced the merged file -
-                # almost always means ffmpeg is missing or failed, and
-                # separate video/audio streams were left on disk instead.
                 error_msg = (
                     "Video and audio downloaded as separate streams but were "
                     "never merged into one file (this usually means ffmpeg is "
@@ -1246,22 +1363,67 @@ def download_task(url: str, task_id: str, file_path: str, media_type: str = "vid
                     f"Leftover files: {[os.path.basename(m) for m in leftover]}"
                 )
                 logger.error(f"[{task_id}] {error_msg}")
-                _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=error_msg)
+                _persist(
+                    status="failed",
+                    phase="failed",
+                    progress=last_progress,
+                    url=url,
+                    file_path=file_path,
+                    error=error_msg,
+                    error_code=classify_error(error_msg),
+                )
                 cleanup_task_fragments(task_id)
             else:
-                _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error="yt-dlp exited 0 but no output file was found")
+                err_msg = "yt-dlp exited 0 but no output file was found"
+                _persist(
+                    status="failed",
+                    phase="failed",
+                    progress=last_progress,
+                    url=url,
+                    file_path=file_path,
+                    error=err_msg,
+                    error_code=classify_error(err_msg),
+                )
 
     except subprocess.TimeoutExpired:
-        _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error="timeout")
+        err_msg = "timeout"
+        _persist(
+            status="failed",
+            phase="failed",
+            progress=last_progress,
+            url=url,
+            file_path=file_path,
+            error=err_msg,
+            error_code=classify_error(err_msg),
+        )
         cleanup_task_fragments(task_id)
     except FileNotFoundError as e:
-        _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=f"yt-dlp not found on server: {e}")
+        err_msg = f"yt-dlp not found on server: {e}"
+        _persist(
+            status="failed",
+            phase="failed",
+            progress=last_progress,
+            url=url,
+            file_path=file_path,
+            error=err_msg,
+            error_code=classify_error(err_msg),
+        )
     except Exception as e:
         logger.exception(f"[{task_id}] Unexpected exception in download_task")
-        _persist(status="failed", progress=last_progress, url=url, file_path=file_path, error=str(e))
+        err_msg = str(e)
+        _persist(
+            status="failed",
+            phase="failed",
+            progress=last_progress,
+            url=url,
+            file_path=file_path,
+            error=err_msg,
+            error_code=classify_error(err_msg),
+        )
         cleanup_task_fragments(task_id)
     finally:
         _release_download_slot()
+
 
 
 @app.get("/status/{task_id}", dependencies=[Depends(require_api_key)])
